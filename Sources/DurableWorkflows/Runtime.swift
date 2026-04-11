@@ -71,9 +71,7 @@ public distributed actor DurableActivityDispatchWorker<WorkflowType: WorkflowPro
     self.actorSystem = actorSystem
     self.container = WorkflowType.Activities()
     await self.actorSystem.receptionist.checkIn(self, with: .durableWorkers(for: WorkflowType.self))
-    Task {
-      try? await self.actorSystem.workflows.recoverAll(ofType: WorkflowType.self)
-    }
+    self.checkRecover()
   }
 
   distributed public func submit(work: ActivityInvocation) async throws -> ActivityInvocationResult {
@@ -97,7 +95,6 @@ public distributed actor DurableActivityDispatchWorker<WorkflowType: WorkflowPro
       }
 
       for await event in self.actorSystem.cluster.events {
-        print("event::", event)
         if case .membershipChange(let change) = event {
           guard change.node == self.actorSystem.cluster.node else {
             continue
