@@ -2,6 +2,10 @@
 
 A research project exploring durable workflow patterns in Swift, built on top of [swift-distributed-actors](https://github.com/apple/swift-distributed-actors), [cluster-event-sourcing](https://github.com/akbashev/cluster-event-sourcing), and [cluster-virtual-actors](https://github.com/akbashev/cluster-virtual-actors).
 
+The `Examples` directory contains a full working example with a web frontend:
+
+![Booking example](Examples/booking-example.png)
+
 The goal was to mimic the design of [swift-temporal-sdk](https://github.com/apple/swift-temporal-sdk) — workflows that survive process crashes and node restarts — but built on top of distributed actors. This was a few-days experiment, not a production system, so expect rough edges that a full Temporal deployment handles for you.
 
 Each activity result is persisted before moving to the next step, so a workflow replays only the activities that haven't completed yet when it resumes.
