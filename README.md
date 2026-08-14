@@ -42,10 +42,12 @@ The core idea is the same — workflows are deterministic functions whose interm
 
 ## Installation
 
+The package currently lives in the [distributed-actors-showcase](https://github.com/akbashev/distributed-actors-showcase) monorepo. Clone it and use a local path dependency:
+
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/akbashev/durable-workflows.git", branch: "main"),
+    .package(path: "../distributed-actors-showcase/durable-workflows"),
 ],
 targets: [
     .target(
