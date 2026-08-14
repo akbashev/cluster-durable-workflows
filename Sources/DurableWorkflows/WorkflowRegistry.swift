@@ -12,11 +12,11 @@ public distributed actor WorkflowRegistry: ClusterSingleton {
   public typealias ActorSystem = ClusterSystem
   public typealias Event = WorkflowRegistryEvent
 
-  struct State: Sendable {
+  public struct State: Codable, Sendable {
     var running: [String: String] = [:]  // id → typeName
   }
 
-  private var state = State()
+  public var state = State()
 
   public init(actorSystem: ClusterSystem) async throws {
     self.actorSystem = actorSystem

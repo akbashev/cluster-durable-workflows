@@ -84,7 +84,7 @@ public distributed actor DurableActivityDispatchWorker<WorkflowType: WorkflowPro
         return .failure(.init(message: message, type: type, isNonRetryable: isNonRetryable))
       }
     } catch {
-      return .failure(.init(message: String(describing: error), type: "ActivityError", isNonRetryable: false))
+      return .failure(.init(message: error.localizedDescription, type: "ActivityError", isNonRetryable: false))
     }
   }
 
@@ -103,7 +103,6 @@ public distributed actor DurableActivityDispatchWorker<WorkflowType: WorkflowPro
             continue
           }
           try? await self.actorSystem.workflows.recoverAll(ofType: WorkflowType.self)
-          // finish checking events
           return
         }
       }
@@ -122,36 +121,21 @@ public enum ActivityOutcomeRecord: Codable, Sendable {
   case failure(ActivityFailurePayload)
 }
 
-public actor ActivityExecutionCursor {
-  private var nextIndex: Int = 0
-  private let cachedOutcomes: [Int: ActivityOutcomeRecord]
-
-  init(cachedOutcomes: [Int: ActivityOutcomeRecord]) {
-    self.cachedOutcomes = cachedOutcomes
-  }
-
-  func nextCall() -> (index: Int, cached: ActivityOutcomeRecord?) {
-    let index = self.nextIndex
-    self.nextIndex += 1
-    return (index, self.cachedOutcomes[index])
-  }
-}
-
 public struct WorkflowContext: Sendable {
-  private let cursor: ActivityExecutionCursor
+  private let cachedOutcomes: [String: ActivityOutcomeRecord]
   private let workflowID: String
   public let system: ClusterSystem
-  private let dispatch: @Sendable (Int, ActivityInvocation, ActivityOptions) async throws -> Data
+  private let dispatch: @Sendable (String, ActivityInvocation, ActivityOptions) async throws -> Data
   private let decoder: JSONDecoder
   private let encoder: JSONEncoder
 
   init(
-    cursor: ActivityExecutionCursor,
+    cachedOutcomes: [String: ActivityOutcomeRecord],
     workflowID: String,
     system: ClusterSystem,
-    dispatch: @escaping @Sendable (Int, ActivityInvocation, ActivityOptions) async throws -> Data
+    dispatch: @escaping @Sendable (String, ActivityInvocation, ActivityOptions) async throws -> Data
   ) {
-    self.cursor = cursor
+    self.cachedOutcomes = cachedOutcomes
     self.workflowID = workflowID
     self.system = system
     self.dispatch = dispatch
@@ -180,9 +164,10 @@ public struct WorkflowContext: Sendable {
   ) async throws -> ActivityType.Output {
     try Task.checkCancellation()
 
-    let (index, cached) = await cursor.nextCall()
+    let inputData = try encoder.encode(input)
+    let key = "\(ActivityType.name):\(inputData.base64EncodedString())"
 
-    if let cached {
+    if let cached = cachedOutcomes[key] {
       switch cached {
       case .success(let outputData):
         return try decoder.decode(ActivityType.Output.self, from: outputData)
@@ -195,22 +180,21 @@ public struct WorkflowContext: Sendable {
       }
     }
 
-    let inputData = try encoder.encode(input)
     let invocation = ActivityInvocation(
       name: ActivityType.name,
       inputData: inputData,
       workflowID: workflowID
     )
 
-    let outputData = try await dispatch(index, invocation, options)
+    let outputData = try await dispatch(key, invocation, options)
     return try decoder.decode(ActivityType.Output.self, from: outputData)
   }
 }
 
 public enum WorkflowEvent: Codable, Sendable {
   case executionStarted(inputData: Data)
-  case activitySucceeded(index: Int, name: String, outputData: Data)
-  case activityFailed(index: Int, name: String, failure: ActivityFailurePayload)
+  case activitySucceeded(key: String, name: String, outputData: Data)
+  case activityFailed(key: String, name: String, failure: ActivityFailurePayload)
   case executionCompleted(outputData: Data)
   case executionCancelled
   case executionFailed(message: String)
@@ -240,7 +224,8 @@ public struct WorkflowStatusInfo: Codable, Sendable {
 }
 
 @EventSourced
-public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualActor {
+@VirtualActor
+public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   public typealias ActorSystem = ClusterSystem
   public typealias Event = WorkflowEvent
 
@@ -252,15 +237,15 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualA
     }
   }
 
-  struct State: Sendable {
+  public struct State: Codable, Sendable {
     var status: WorkflowStatus = .idle
     var inputData: Data?
-    var activityOutcomes: [Int: ActivityOutcomeRecord] = [:]
+    var activityOutcomes: [String: ActivityOutcomeRecord] = [:]
     var events: [WorkflowEvent] = []
     var error: String?
   }
 
-  private var state = State()
+  public var state = State()
   private let encoder: JSONEncoder
   private let decoder: JSONDecoder
 
@@ -294,16 +279,6 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualA
     if case .running = self.state.status {
       Task { try? await self.resume() }
     }
-  }
-
-  public static func spawn(
-    on actorSystem: ClusterSystem,
-    dependency: any Sendable & Codable
-  ) async throws -> Self {
-    guard let typedDependency = dependency as? Dependency else {
-      throw VirtualActorError.spawnDependencyTypeMismatch
-    }
-    return try await Self(actorSystem: actorSystem, dependency: typedDependency)
   }
 
   distributed public func getStatus() async throws -> WorkflowStatusInfo {
@@ -368,18 +343,17 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualA
   private func _run(input: WorkflowType.Input) async throws -> WorkflowResult<WorkflowType.Output> {
     let workflowTask = Task {
       let workflow = WorkflowType()
-      let cursor = ActivityExecutionCursor(cachedOutcomes: self.state.activityOutcomes)
       let context = WorkflowContext(
-        cursor: cursor,
+        cachedOutcomes: self.state.activityOutcomes,
         workflowID: self.workflowID,
         system: self.actorSystem,
-        dispatch: { index, invocation, _ in
+        dispatch: { key, invocation, _ in
           let result = try await self.activityPool.submit(work: invocation)
           switch result {
           case .success(let outputData):
             try await self.emit(
               event: .activitySucceeded(
-                index: index,
+                key: key,
                 name: invocation.name,
                 outputData: outputData
               )
@@ -388,7 +362,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualA
           case .failure(let failure):
             try await self.emit(
               event: .activityFailed(
-                index: index,
+                key: key,
                 name: invocation.name,
                 failure: failure
               )
@@ -407,8 +381,13 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualA
         let outputData = try self.encoder.encode(output)
         try await self.emit(event: .executionCompleted(outputData: outputData))
         return WorkflowResult(output: output)
+      } catch let appError as ApplicationError {
+        if case .typed(let message, _, _) = appError {
+          try await self.emit(event: .executionFailed(message: message))
+        }
+        throw appError
       } catch {
-        try await self.emit(event: .executionFailed(message: String(describing: error)))
+        try await self.emit(event: .executionFailed(message: error.localizedDescription))
         throw error
       }
     }
@@ -435,10 +414,10 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol>: VirtualA
       self.state.status = .running
       self.state.inputData = inputData
       self.state.error = nil
-    case .activitySucceeded(let index, _, let outputData):
-      self.state.activityOutcomes[index] = .success(outputData: outputData)
-    case .activityFailed(let index, _, let failure):
-      self.state.activityOutcomes[index] = .failure(failure)
+    case .activitySucceeded(let key, _, let outputData):
+      self.state.activityOutcomes[key] = .success(outputData: outputData)
+    case .activityFailed(let key, _, let failure):
+      self.state.activityOutcomes[key] = .failure(failure)
     case .executionCompleted(let outputData):
       self.state.status = .completed(data: outputData)
       self.state.error = nil
