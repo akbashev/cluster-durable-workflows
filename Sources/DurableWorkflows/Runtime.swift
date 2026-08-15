@@ -13,12 +13,19 @@ public enum WorkflowRuntimeError: Error, Sendable, Equatable {
   case workflowInputMismatch
   case workflowCancelled
   case workflowNotRunning
-  /// `WorkflowContext.sleep` was called with a negative duration.
-  case invalidTimerDuration
-  /// Replay found a different duration at this timer sequence than the
-  /// workflow code requested — the workflow code changed incompatibly, or
-  /// concurrent timers were scheduled in a different order than recorded.
-  case nondeterministicTimer(sequence: Int, expected: Duration, actual: Duration)
+  /// Replay found a different operation kind at this sequence than the
+  /// workflow code requested (e.g. a timer where history recorded a
+  /// timestamp) — the workflow code changed incompatibly, or concurrent
+  /// operations were scheduled in a different order than recorded.
+  case nondeterministicOperation(sequence: Int, expected: String, actual: String)
+  /// Replay of `sleep(until: Date)` found a different deadline at this
+  /// sequence than history recorded — the workflow code changed
+  /// incompatibly over a live execution. Version the workflow instead.
+  /// (The `Instant` overload is not validated — per-boot values are not
+  /// reproducible.)
+  case nondeterministicDeadline(sequence: Int, expected: Date, actual: Date)
+  /// `WorkflowContext.timeout(for:body:)` elapsed before the body finished.
+  case timeoutExceeded
 }
 
 public enum ApplicationError: Error, Codable, Sendable {
@@ -131,33 +138,38 @@ public enum ActivityOutcomeRecord: Codable, Sendable {
 public struct WorkflowContext: Sendable {
   private let cachedOutcomes: [String: ActivityOutcomeRecord]
   private let cachedTimers: [Int: TimerState]
+  private let cachedTimestamps: [Int: ContinuousClock.Instant]
   private let workflowID: String
   public let system: ClusterSystem
   private let dispatch: @Sendable (String, ActivityInvocation, ActivityOptions) async throws -> Data
-  private let recordTimerEvent: @Sendable (WorkflowEvent) async throws -> Void
-  /// Per-run timer sequence allocation, owned by the runtime (`WorkflowActor`)
-  /// — the same place the journaled timer events live. The context itself
-  /// holds no mutable bookkeeping.
-  private let allocateTimerSequence: @Sendable () async -> Int
+  private let recordEvent: @Sendable (WorkflowEvent) async throws -> Void
+  /// Per-run sequence allocation for ALL journaled operations (`sleep`,
+  /// `now`), owned by the runtime (`WorkflowActor`) — the same place the
+  /// journaled events live. One ordinal space across operation kinds makes
+  /// cross-kind reordering detectable on replay. The context itself holds
+  /// no mutable bookkeeping.
+  private let allocateSequence: @Sendable () async -> Int
   private let decoder: JSONDecoder
   private let encoder: JSONEncoder
 
   init(
     cachedOutcomes: [String: ActivityOutcomeRecord],
     cachedTimers: [Int: TimerState],
+    cachedTimestamps: [Int: ContinuousClock.Instant],
     workflowID: String,
     system: ClusterSystem,
     dispatch: @escaping @Sendable (String, ActivityInvocation, ActivityOptions) async throws -> Data,
-    recordTimerEvent: @escaping @Sendable (WorkflowEvent) async throws -> Void,
-    allocateTimerSequence: @escaping @Sendable () async -> Int
+    recordEvent: @escaping @Sendable (WorkflowEvent) async throws -> Void,
+    allocateSequence: @escaping @Sendable () async -> Int
   ) {
     self.cachedOutcomes = cachedOutcomes
     self.cachedTimers = cachedTimers
+    self.cachedTimestamps = cachedTimestamps
     self.workflowID = workflowID
     self.system = system
     self.dispatch = dispatch
-    self.recordTimerEvent = recordTimerEvent
-    self.allocateTimerSequence = allocateTimerSequence
+    self.recordEvent = recordEvent
+    self.allocateSequence = allocateSequence
 
     let decoder = JSONDecoder()
     decoder.userInfo[.actorSystemKey] = system
@@ -209,8 +221,7 @@ public struct WorkflowContext: Sendable {
     return try decoder.decode(ActivityType.Output.self, from: outputData)
   }
 
-  /// Durably sleeps for `duration` — the equivalent of Temporal's
-  /// `Workflow.sleep(for:summary:)`.
+  /// Durably sleeps until a monotonic-clock instant.
   ///
   /// The timer is journaled (`timerScheduled`, then `timerFired`) with an
   /// absolute wall-clock deadline: after a crash or passivation the resumed
@@ -222,56 +233,102 @@ public struct WorkflowContext: Sendable {
   /// The wait itself runs entirely on `ContinuousClock`. `Date` appears ONLY
   /// at the storage boundary: the journaled wall-clock deadline (which stays
   /// meaningful across reboots and nodes) is translated once into the
-  /// monotonic domain on the way in, and produced once on the way out.
+  /// monotonic domain on the way in.
   ///
   /// - Parameters:
-  ///   - duration: must be non-negative; zero is normalized to a minimal
-  ///     positive duration (a timer is still journaled).
+  ///   - instant: a `ContinuousClock.Instant`; a past instant still journals
+  ///     a timer (normalized to a minimal positive duration) and returns
+  ///     immediately.
   ///   - summary: diagnostic metadata recorded in history — NOT the timer's
-  ///     identity. Timers are identified by a per-run sequence number.
+  ///     identity. Timers are identified by a per-run sequence number shared
+  ///     with every other journaled operation (`now`).
   ///
   /// - Warning: sequence numbers are allocated by the runtime per call, in
   ///   arrival order — so sequential sleeps replay deterministically, but
   ///   concurrent sleeps (task groups) may be numbered in a different order
-  ///   across replays. A mismatched duration at a recorded sequence is caught
-  ///   and throws
-  ///   ``WorkflowRuntimeError/nondeterministicTimer(sequence:expected:actual:)``;
-  ///   concurrent timers with *identical* durations can swap undetected.
-  public func sleep(for duration: Duration, summary: String? = nil) async throws {
-    try Task.checkCancellation()
-    guard duration >= .zero else { throw WorkflowRuntimeError.invalidTimerDuration }
-    // Temporal behavior: a zero-duration timer still exists in history.
-    let normalized = max(duration, .milliseconds(1))
-    let sequence = await self.allocateTimerSequence()
+  ///   across replays. A timer at a sequence recorded as a different
+  ///   operation kind is caught and throws
+  ///   ``WorkflowRuntimeError/nondeterministicOperation(sequence:expected:actual:)``;
+  ///   concurrent timers can swap sequence numbers undetected.
+  public func sleep(until instant: ContinuousClock.Instant, summary: String? = nil) async throws {
+    try await self._sleep(until: instant, summary: summary, wallDeadline: nil)
+  }
 
-    let fireAt: ContinuousClock.Instant
+  /// Wall-clock convenience overload of `sleep(until:summary:)` for
+  /// deadlines arriving from the outside world (a subscription renewal date,
+  /// a campaign end). Converts to the monotonic domain at the boundary and
+  /// delegates; the journal records the exact date.
+  ///
+  /// Unlike the `Instant` overload, this one IS value-validated on replay:
+  /// a `Date` argument is reproducible (it should come from journaled state),
+  /// so a re-run passing a different date throws
+  /// ``WorkflowRuntimeError/nondeterministicDeadline(sequence:expected:actual:)``.
+  public func sleep(until date: Date, summary: String? = nil) async throws {
+    try await self._sleep(until: date.continuousClockInstant, summary: summary, wallDeadline: date)
+  }
+
+  /// Duration convenience overload of `sleep(until:summary:)` —
+  /// the equivalent of Temporal's `Workflow.sleep(for:summary:)`. Resolves
+  /// to an instant on the monotonic clock and delegates.
+  public func sleep(for duration: Duration, summary: String? = nil) async throws {
+    try await self.sleep(until: .now + duration, summary: summary)
+  }
+
+  private func _sleep(
+    until instant: ContinuousClock.Instant,
+    summary: String?,
+    wallDeadline: Date?
+  ) async throws {
+    try Task.checkCancellation()
+    let sequence = await self.allocateSequence()
+    // One ordinal space across operation kinds — shared with `now`.
+    if self.cachedTimestamps[sequence] != nil {
+      throw WorkflowRuntimeError.nondeterministicOperation(
+        sequence: sequence,
+        expected: "timer",
+        actual: "timestamp"
+      )
+    }
+
     switch self.cachedTimers[sequence] {
     case .fired:
       return
     case .cancelled:
       throw CancellationError()
-    case .scheduled(let recordedDuration, let storedDeadline, _):
-      guard recordedDuration == normalized else {
-        throw WorkflowRuntimeError.nondeterministicTimer(
-          sequence: sequence, expected: recordedDuration, actual: normalized
+    case .scheduled(_, let storedDeadline, _):
+      // Validated exactly when the caller's value is reproducible across
+      // replays (the Date overload). JSON round-trips Date at sub-microsecond
+      // precision; allow slack for encoding differences rather than
+      // demanding bit-equality.
+      if let wallDeadline, abs(storedDeadline.timeIntervalSince(wallDeadline)) >= 0.001 {
+        throw WorkflowRuntimeError.nondeterministicDeadline(
+          sequence: sequence,
+          expected: storedDeadline,
+          actual: wallDeadline
         )
       }
-      // Storage boundary, read side: wall clock → monotonic, once. A
-      // deadline in the past maps to a past instant — "fire immediately".
-      fireAt = .now + .seconds(storedDeadline.timeIntervalSinceNow)
+      // Wait out the stored wall-clock deadline, translated once into the
+      // monotonic domain.
+      try await self.waitForTimer(sequence: sequence, fireAt: storedDeadline.continuousClockInstant)
     case nil:
-      fireAt = .now + normalized
-      // Storage boundary, write side: monotonic → wall clock, once.
-      try await self.recordTimerEvent(
+      // Normalize to a minimal positive duration so a past instant still
+      // journals a timer.
+      let normalized = max(ContinuousClock.Instant.now.duration(to: instant), .milliseconds(1))
+      try await self.recordEvent(
         .timerScheduled(
           sequence: sequence,
           duration: normalized,
-          deadline: Date(after: normalized),
+          deadline: wallDeadline ?? Date(after: normalized),
           summary: summary
         )
       )
+      try await self.waitForTimer(sequence: sequence, fireAt: instant)
     }
+  }
 
+  /// Shared wait tail of `sleep(until:)`: sleep on the
+  /// monotonic clock, journal cancellation or firing.
+  private func waitForTimer(sequence: Int, fireAt: ContinuousClock.Instant) async throws {
     do {
       // A past instant returns immediately — an overdue timer fires as soon
       // as the run resumes.
@@ -279,10 +336,79 @@ public struct WorkflowContext: Sendable {
     } catch is CancellationError {
       // Persist the cancellation: replay must rethrow instead of
       // recreating the sleep.
-      try? await self.recordTimerEvent(.timerCancelled(sequence: sequence))
+      try? await self.recordEvent(.timerCancelled(sequence: sequence))
       throw CancellationError()
     }
-    try await self.recordTimerEvent(.timerFired(sequence: sequence))
+    try await self.recordEvent(.timerFired(sequence: sequence))
+  }
+
+  /// Deterministic workflow time as a monotonic instant, for Clock/Duration
+  /// arithmetic in workflow code.
+  ///
+  /// Each call is journaled (`timestampRecorded`) as a wall-clock `Date` —
+  /// the only representation that survives reboots and nodes exactly. Live
+  /// calls return a fresh `ContinuousClock.Instant`; on replay the journaled
+  /// date is translated once, at journal-fold time, into the monotonic
+  /// domain (`Date.continuousClockInstant`), so all replayed values in one
+  /// run share a single anchor and their *differences* are exact.
+  ///
+  /// - Warning: a replayed value approximates the recorded moment up to
+  ///   wall↔monotonic drift between runs (e.g. NTP steps). Never feed a
+  ///   `now`-derived value into an activity input or anything else that
+  ///   lands in a content-addressed journal key — those require byte-exact
+  ///   replay. For calendar facts from the outside world (renewal dates,
+  ///   deadlines), prefer ``sleep(until:summary:)``, which binds by the
+  ///   exact journaled deadline.
+  ///
+  /// Every call costs a journal write — keep `now` out of hot loops.
+  public var now: ContinuousClock.Instant {
+    get async throws {
+      try Task.checkCancellation()
+      let sequence = await self.allocateSequence()
+      // One ordinal space across operation kinds — see `sleep`.
+      if self.cachedTimers[sequence] != nil {
+        throw WorkflowRuntimeError.nondeterministicOperation(
+          sequence: sequence,
+          expected: "timestamp",
+          actual: "timer"
+        )
+      }
+      if let recorded = self.cachedTimestamps[sequence] { return recorded }
+      let now = Date.now
+      try await self.recordEvent(.timestampRecorded(sequence: sequence, date: now))
+      return now.continuousClockInstant
+    }
+  }
+
+  /// Runs `body` and throws ``WorkflowRuntimeError/timeoutExceeded`` if it
+  /// does not finish within `duration` — built on ``sleep(until:summary:)``,
+  /// like Temporal's `Workflow.timeout`.
+  ///
+  /// The losing side is cancelled: if the timer fires first, `body` is
+  /// cancelled (and its already-journaled steps replay normally); if `body`
+  /// finishes first, the timer is cancelled and a `timerCancelled` event is
+  /// journaled so replay does not recreate it.
+  ///
+  /// - Warning: `body` runs concurrently with the timer task, so if `body`
+  ///   itself calls ``sleep(until:summary:)`` the two allocate timer sequences
+  ///   in nondeterministic order across replays — see the warning on
+  ///   ``sleep(until:summary:)``.
+  public func timeout<T: Sendable>(
+    for duration: Duration,
+    body: @escaping @Sendable () async throws -> T
+  ) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+      group.addTask { try await body() }
+      group.addTask {
+        try await self.sleep(until: .now + duration)
+        throw WorkflowRuntimeError.timeoutExceeded
+      }
+      defer { group.cancelAll() }
+      guard let first = try await group.next() else {
+        throw WorkflowRuntimeError.timeoutExceeded
+      }
+      return first
+    }
   }
 }
 
@@ -293,6 +419,7 @@ public enum WorkflowEvent: Codable, Sendable {
   case timerScheduled(sequence: Int, duration: Duration, deadline: Date, summary: String?)
   case timerFired(sequence: Int)
   case timerCancelled(sequence: Int)
+  case timestampRecorded(sequence: Int, date: Date)
   case executionCompleted(outputData: Data)
   case executionCancelled
   case executionFailed(message: String)
@@ -347,6 +474,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     var inputData: Data?
     var activityOutcomes: [String: ActivityOutcomeRecord] = [:]
     var timers: [Int: TimerState] = [:]
+    var timestamps: [Int: ContinuousClock.Instant] = [:]
     var events: [WorkflowEvent] = []
     var error: String?
   }
@@ -360,17 +488,20 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   private let activityPool: WorkerPool<DurableActivityDispatchWorker<WorkflowType>>
   private var currentExecutionTask: Task<WorkflowResult<WorkflowType.Output>, Error>?
 
-  /// Per-run timer sequence cursor, reset at the start of every `_run`: each
-  /// run — fresh or replayed — allocates 0, 1, 2… in call order, so a
-  /// replayed `sleep` binds to the same journaled timer it created. Actor
-  /// isolation makes allocation atomic; concurrent `sleep` calls are
-  /// numbered in message-arrival order, which is nondeterministic across
-  /// replays (see `WorkflowContext.sleep`).
-  private var timerSequenceCursor = 0
+  /// Per-run operation cursor, reset at the start of every `_run`: each run —
+  /// fresh or replayed — allocates 0, 1, 2… in call order across ALL journaled
+  /// operations (`sleep`, `now`), so a replayed call binds to the same
+  /// journaled entry it created. One ordinal space for every operation kind
+  /// means cross-kind reordering is detectable (a `sleep` landing on a
+  /// recorded timestamp position fails loudly instead of duplicating).
+  /// Actor isolation makes allocation atomic; concurrent calls are numbered
+  /// in message-arrival order, which is nondeterministic across replays
+  /// (see `WorkflowContext.sleep`).
+  private var operationSequenceCursor = 0
 
-  private func nextTimerSequence() -> Int {
-    defer { self.timerSequenceCursor += 1 }
-    return self.timerSequenceCursor
+  private func nextOperationSequence() -> Int {
+    defer { self.operationSequenceCursor += 1 }
+    return self.operationSequenceCursor
   }
 
   public init(actorSystem: ClusterSystem, dependency: Dependency) async throws {
@@ -468,13 +599,15 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   }
 
   private func _run(input: WorkflowType.Input) async throws -> WorkflowResult<WorkflowType.Output> {
-    // A run — fresh or replayed — numbers its timers from 0 in call order.
-    self.timerSequenceCursor = 0
+    // A run — fresh or replayed — numbers its journaled operations from 0
+    // in call order.
+    self.operationSequenceCursor = 0
     let workflowTask = Task {
       let workflow = WorkflowType()
       let context = WorkflowContext(
         cachedOutcomes: self.state.activityOutcomes,
         cachedTimers: self.state.timers,
+        cachedTimestamps: self.state.timestamps,
         workflowID: self.workflowID,
         system: self.actorSystem,
         dispatch: { key, invocation, _ in
@@ -504,10 +637,10 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
             )
           }
         },
-        recordTimerEvent: { event in
+        recordEvent: { event in
           try await self.emit(event: event)
         },
-        allocateTimerSequence: { await self.nextTimerSequence() }
+        allocateSequence: { await self.nextOperationSequence() }
       )
 
       do {
@@ -531,7 +664,19 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     }
 
     self.currentExecutionTask = workflowTask
-    defer { self.currentExecutionTask = nil }
+    defer {
+      self.currentExecutionTask = nil
+      // A terminal workflow is pure journal from here on — evict the actor
+      // rather than holding it resident. Detached so the in-flight
+      // distributed call's reply is delivered before the actor disappears;
+      // reactivation on the next call just replays the journal.
+      switch self.state.status {
+      case .completed, .cancelled:
+        Task { try? await self.actorSystem.virtualActors.deactivate(self) }
+      case .idle, .running, .failed:
+        break
+      }
+    }
 
     return try await withTaskCancellationHandler {
       try await workflowTask.value
@@ -573,6 +718,8 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
       self.state.timers[sequence] = .fired
     case .timerCancelled(let sequence):
       self.state.timers[sequence] = .cancelled
+    case .timestampRecorded(let sequence, let date):
+      self.state.timestamps[sequence] = date.continuousClockInstant
     case .executionCompleted(let outputData):
       self.state.status = .completed(data: outputData)
       self.state.error = nil
@@ -582,5 +729,16 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     case .executionCancelled:
       self.state.status = .cancelled
     }
+  }
+}
+
+extension Date {
+  /// Converts this wall-clock date into an approximate monotonic instant.
+  ///
+  /// The conversion is anchored at the moment this property is accessed.
+  var continuousClockInstant: ContinuousClock.Instant {
+    ContinuousClock.Instant.now.advanced(
+      by: .seconds(self.timeIntervalSinceNow)
+    )
   }
 }

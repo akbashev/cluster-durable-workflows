@@ -18,6 +18,7 @@ Each activity result is persisted before moving to the next step, so a workflow 
 | **Storage** | Pluggable `EventStore` (file, Postgres, …) | Temporal's own persistence (Postgres/Cassandra) |
 | **Workflow definition** | `@Workflow` | `@Workflow` |
 | **Activity definition** | `@Activity` inside `@ActivityContainer` | `@Activity` inside `@ActivityContainer` |
+| **Timers** | In-process: the workflow actor waits, journaled deadline | Server-side timer service; workflow evicted until fire time |
 | **Maturity** | Research / showcase | Production-ready |
 
 The core idea is the same — workflows are deterministic functions whose intermediate results are persisted — but DurableWorkflows is fully self-contained Swift with no external services required beyond an event store.
@@ -31,7 +32,7 @@ The core idea is the same — workflows are deterministic functions whose interm
 
 **Activity** — a side-effectful unit of work (API call, DB write, payment charge). Defined with `@Activity` inside an `@ActivityContainer`. Activities are individually persisted and never re-executed on replay.
 
-**WorkflowContext** — passed into `run(input:context:)`. Use it to execute activities (`context.executeActivity(...)`) and resolve distributed actors (`context.getActor(...)`).
+**WorkflowContext** — passed into `run(input:context:)`. Use it to execute activities (`context.executeActivity(...)`), sleep durably (`context.sleep(...)`), read deterministic time (`context.now`), and resolve distributed actors (`context.getActor(...)`).
 
 **Event store** — pluggable persistence for workflow and activity events. Swap between file-based (dev) and Postgres (production) without changing any workflow code.
 
@@ -172,6 +173,54 @@ func run(input: Input, context: WorkflowContext) async throws -> Output {
     }
 }
 ```
+
+## Timers and deterministic time
+
+Workflows can sleep durably — the timer survives crashes and restarts:
+
+```swift
+func run(input: Input, context: WorkflowContext) async throws -> Output {
+    try await context.executeActivity(ChargeCustomer.self, input: input)
+
+    // Three overloads, one mechanism:
+    try await context.sleep(for: .days(30))                    // Duration
+    try await context.sleep(until: .now + .days(30))           // ContinuousClock.Instant
+    try await context.sleep(until: subscription.renewsAt)      // Date — for deadlines from the outside world
+
+    let now = try await context.now  // deterministic workflow time (ContinuousClock.Instant)
+
+    let result = try await context.timeout(for: .seconds(30)) {
+        try await someOperation()
+    }
+}
+```
+
+A `sleep` journals `timerScheduled` with an **absolute wall-clock deadline** before waiting, and `timerFired` after. On recovery, the replayed run binds to the recorded timer by sequence number and waits only the *remaining* time — a 30-day timer that crashes on day 29 sleeps one more day, not thirty. `Date` appears only at the storage boundary; the wait itself runs on `ContinuousClock`.
+
+Rules worth knowing:
+
+- **`summary` is metadata, not identity.** Timers bind by per-run sequence number, allocated in call order and shared with `now`. Sequential sleeps replay deterministically; concurrent sleeps (task groups) are numbered in arrival order and may swap across replays — keep timers sequential for now.
+- **The `Date` overload is value-validated on replay.** The date should come from journaled state (input, activity results). If changed workflow code passes a different date than history recorded, the run fails with `nondeterministicDeadline` instead of silently waking at the old deadline — the same fail-loudly contract activities have. The `Instant`/`Duration` overloads can't be validated this way (per-boot values aren't reproducible).
+- **Cancelling a sleeping task journals `timerCancelled`** so replay rethrows instead of recreating the sleep.
+
+## Design notes vs. Temporal
+
+Temporal never sleeps on the worker: `sleep` emits a command, and a **server-side timer service** owns the deadline — the workflow can stay evicted for weeks and gets rehydrated when the server fires the timer. Our model is simpler: the workflow actor itself waits (on `ContinuousClock`), held resident in memory by `shouldDeactivate` refusing to passivate a running workflow, and recovered by journal replay if the node restarts.
+
+Trade-offs of the simple model:
+
+- **Pro:** no separate scheduler component, no extra infrastructure; timer correctness falls out of the same journal replay everything else uses.
+- **Con:** a workflow on a 30-day timer keeps its actor resident in memory for 30 days. Fine at showcase scale; a fleet of long-sleeping workflows would want the Temporal-style split.
+- **Con:** the live wait is monotonic while the journaled deadline is wall-clock, so a wall-clock step (NTP jump) during an uninterrupted wait is only noticed at the next resume.
+
+## Next steps
+
+Things deliberately not built yet, in rough priority order:
+
+1. **Scheduler/timer service actor** — scan journaled `timerScheduled` deadlines and wake workflows at fire time, Temporal-style. Unlocks evicting long-sleeping workflows from memory. Only worth it if timer volume justifies it.
+2. **Node-down timer recovery** — when a cluster member leaves for good, nothing re-homes its pending timers today (`recoverAll` covers node *restart*). Needs a scan-on-member-down plus a slow periodic sweep; folds into the planned Raft work in `distributed-actors` (split-brain safety is a prerequisite — two nodes must never resume the same timer).
+3. **Deterministic executor for concurrent sleeps** — sequence allocation across task groups is arrival-order today; full Temporal semantics need deterministic scheduling or a richer command-history model.
+4. **Cancellation shielding** (`withCancellationShield`-style) for compensation blocks — Temporal has it; our README workaround is a detached `Task`.
 
 ## Durability
 

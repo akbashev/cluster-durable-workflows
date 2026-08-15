@@ -35,7 +35,8 @@ final class InMemoryEventStore: EventStore, Sendable {
     fromSequenceNumber: Int64
   ) async throws -> [Event] {
     let log = self.storage.withLock { $0[id] ?? [] }
-    return try log
+    return
+      try log
       .filter { $0.sequenceNumber >= fromSequenceNumber }
       .map { try JSONDecoder().decode(Event.self, from: $0.data) }
   }

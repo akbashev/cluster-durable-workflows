@@ -12,7 +12,9 @@ struct TimerWorkflowTests {
   @Test
   func sleepCompletesAndJournalsTimerEvents() async throws {
     let (system, node, worker) = try await makeWorkflowSystem(
-      name: "timers-basic", port: 4600, store: InMemoryEventStore()
+      name: "timers-basic",
+      port: 4600,
+      store: InMemoryEventStore()
     )
     let options = WorkflowOptions(id: "wf-basic")
 
@@ -37,7 +39,8 @@ struct TimerWorkflowTests {
     }
     #expect(scheduled.count == 1)
     #expect(scheduled.first?.0 == 0)
-    #expect(scheduled.first?.1 == .milliseconds(200))
+    // Measured a hair after `.now + duration` — just under, never over.
+    #expect(scheduled.first?.1 ?? .zero > .milliseconds(199) && scheduled.first?.1 ?? .zero <= .milliseconds(200))
     #expect(scheduled.first?.2 == "test timer")
 
     let fired = info.events.contains { event in
@@ -53,7 +56,9 @@ struct TimerWorkflowTests {
   @Test
   func cancelDuringSleepEndsAsCancelledNotFailed() async throws {
     let (system, node, worker) = try await makeWorkflowSystem(
-      name: "timers-cancel", port: 4601, store: InMemoryEventStore()
+      name: "timers-cancel",
+      port: 4601,
+      store: InMemoryEventStore()
     )
     let options = WorkflowOptions(id: "wf-cancel")
 
@@ -101,7 +106,9 @@ struct TimerWorkflowTests {
   func crashDuringSleepResumesWithRemainingTimeOnly() async throws {
     let store = InMemoryEventStore()
     let (system, node, worker) = try await makeWorkflowSystem(
-      name: "timers-crash", port: 4603, store: store
+      name: "timers-crash",
+      port: 4603,
+      store: store
     )
     let options = WorkflowOptions(id: "wf-crash")
 
@@ -158,23 +165,25 @@ struct TimerWorkflowTests {
   }
 
   @Test
-  func negativeDurationFailsTheRun() async throws {
+  func negativeDurationCompletesLikePastDeadline() async throws {
     let (system, node, worker) = try await makeWorkflowSystem(
-      name: "timers-negative", port: 4602, store: InMemoryEventStore()
+      name: "timers-negative",
+      port: 4602,
+      store: InMemoryEventStore()
     )
     let options = WorkflowOptions(id: "wf-negative")
 
-    await #expect(throws: WorkflowRuntimeError.invalidTimerDuration) {
-      try await system.workflows.execute(
-        type: TimerWorkflow.self,
-        options: options,
-        input: .init(delayMillis: -5)
-      )
-    }
+    // A negative duration resolves to a past instant: normalized to a
+    // minimal timer, fires immediately, the run completes.
+    try await system.workflows.execute(
+      type: TimerWorkflow.self,
+      options: options,
+      input: .init(delayMillis: -5)
+    )
 
     let info = try await system.workflows.getStatus(type: TimerWorkflow.self, options: options)
-    guard case .failed = info.status else {
-      Issue.record("expected failed, got \(info.status)")
+    guard case .completed = info.status else {
+      Issue.record("expected completed, got \(info.status)")
       return
     }
 
