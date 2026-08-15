@@ -174,6 +174,27 @@ func run(input: Input, context: WorkflowContext) async throws -> Output {
 }
 ```
 
+### Retry
+
+A workflow run can be retried automatically with exponential backoff — the same shape as Temporal's `RetryPolicy`:
+
+```swift
+let options = WorkflowOptions(
+    id: "order-\(orderId)",
+    retryPolicy: RetryPolicy(
+        initialInterval: .milliseconds(200),  // backoff before the first retry
+        backoffCoefficient: 1.5,              // growth per retry
+        maximumInterval: .seconds(30),        // optional backoff cap
+        maximumAttempts: 3,                   // total attempts, first run included
+        nonRetryableErrorTypes: ["ValidationError"]  // fail these immediately
+    )
+)
+```
+
+When a run fails with attempts remaining, the runtime journals `retryScheduled` with an **absolute deadline** and the next attempt starts after the backoff. A crash mid-backoff loses nothing: recovery resumes the wait from the journaled deadline, then re-runs. `execute` waits through the retries — the caller only sees the final success or the terminal failure. Cancellation during backoff is prompt, and `ApplicationError.typed(..., isNonRetryable: true)` (or a type listed in `nonRetryableErrorTypes`) skips retrying.
+
+Unlike Temporal, a retried attempt **reuses the journal**: completed activities replay from cache, so a workflow-level retry costs only the steps that never completed.
+
 ## Timers and deterministic time
 
 Workflows can sleep durably — the timer survives crashes and restarts:
@@ -217,10 +238,11 @@ Trade-offs of the simple model:
 
 Things deliberately not built yet, in rough priority order:
 
-1. **Scheduler/timer service actor** — scan journaled `timerScheduled` deadlines and wake workflows at fire time, Temporal-style. Unlocks evicting long-sleeping workflows from memory. Only worth it if timer volume justifies it.
-2. **Node-down timer recovery** — when a cluster member leaves for good, nothing re-homes its pending timers today (`recoverAll` covers node *restart*). Needs a scan-on-member-down plus a slow periodic sweep; folds into the planned Raft work in `distributed-actors` (split-brain safety is a prerequisite — two nodes must never resume the same timer).
-3. **Deterministic executor for concurrent sleeps** — sequence allocation across task groups is arrival-order today; full Temporal semantics need deterministic scheduling or a richer command-history model.
-4. **Cancellation shielding** (`withCancellationShield`-style) for compensation blocks — Temporal has it; our README workaround is a detached `Task`.
+1. **Activity-level retry policies** — `ActivityOptions` is accepted but ignored today. Temporal's workhorse is retrying the *activity* (with its own backoff) so transient failures never fail the workflow at all; our `retryPolicy` only retries whole runs.
+2. **Scheduler/timer service actor** — scan journaled `timerScheduled` deadlines and wake workflows at fire time, Temporal-style. Unlocks evicting long-sleeping workflows from memory. Only worth it if timer volume justifies it.
+3. **Node-down timer recovery** — when a cluster member leaves for good, nothing re-homes its pending timers today (`recoverAll` covers node *restart*). Needs a scan-on-member-down plus a slow periodic sweep; folds into the planned Raft work in `distributed-actors` (split-brain safety is a prerequisite — two nodes must never resume the same timer).
+4. **Deterministic executor for concurrent sleeps** — sequence allocation across task groups is arrival-order today; full Temporal semantics need deterministic scheduling or a richer command-history model.
+5. **Cancellation shielding** (`withCancellationShield`-style) for compensation blocks — Temporal has it; our README workaround is a detached `Task`.
 
 ## Durability
 

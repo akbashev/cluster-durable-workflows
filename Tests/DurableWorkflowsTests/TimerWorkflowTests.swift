@@ -6,7 +6,11 @@ import Testing
 
 /// End-to-end timer behavior over a real single-node cluster with an
 /// in-memory journal.
-@Suite(.timeLimit(.minutes(2)))
+///
+/// Serialized: the crash-recovery tests stop and rejoin cluster systems, and
+/// parallel suites competing for CPU made the worker receptionist flaky
+/// (`.noNodesAvailable`) at dispatch time.
+@Suite(.timeLimit(.minutes(2)), .serialized)
 struct TimerWorkflowTests {
 
   @Test

@@ -47,9 +47,9 @@ public struct ActivityFailurePayload: Codable, Sendable {
 public struct ActivityInvocation: Codable, Sendable {
   public let name: String
   public let inputData: Data
-  public let workflowID: String
+  public let workflowID: WorkflowID
 
-  public init(name: String, inputData: Data, workflowID: String) {
+  public init(name: String, inputData: Data, workflowID: WorkflowID) {
     self.name = name
     self.inputData = inputData
     self.workflowID = workflowID
@@ -62,11 +62,11 @@ public enum ActivityInvocationResult: Codable, Sendable {
 }
 
 public struct ActivityContext: Sendable {
-  public let workflowID: String
+  public let workflowID: WorkflowID
   public let activityName: String
   public let system: ClusterSystem
 
-  public init(workflowID: String, activityName: String, system: ClusterSystem) {
+  public init(workflowID: WorkflowID, activityName: String, system: ClusterSystem) {
     self.workflowID = workflowID
     self.activityName = activityName
     self.system = system
@@ -136,12 +136,12 @@ public enum ActivityOutcomeRecord: Codable, Sendable {
 }
 
 public struct WorkflowContext: Sendable {
-  private let cachedOutcomes: [String: ActivityOutcomeRecord]
+  private let cachedOutcomes: [ActivityKey: ActivityOutcomeRecord]
   private let cachedTimers: [Int: TimerState]
   private let cachedTimestamps: [Int: ContinuousClock.Instant]
-  private let workflowID: String
+  private let workflowID: WorkflowID
   public let system: ClusterSystem
-  private let dispatch: @Sendable (String, ActivityInvocation, ActivityOptions) async throws -> Data
+  private let dispatch: @Sendable (ActivityKey, ActivityInvocation, ActivityOptions) async throws -> Data
   private let recordEvent: @Sendable (WorkflowEvent) async throws -> Void
   /// Per-run sequence allocation for ALL journaled operations (`sleep`,
   /// `now`), owned by the runtime (`WorkflowActor`) — the same place the
@@ -153,12 +153,12 @@ public struct WorkflowContext: Sendable {
   private let encoder: JSONEncoder
 
   init(
-    cachedOutcomes: [String: ActivityOutcomeRecord],
+    cachedOutcomes: [ActivityKey: ActivityOutcomeRecord],
     cachedTimers: [Int: TimerState],
     cachedTimestamps: [Int: ContinuousClock.Instant],
-    workflowID: String,
+    workflowID: WorkflowID,
     system: ClusterSystem,
-    dispatch: @escaping @Sendable (String, ActivityInvocation, ActivityOptions) async throws -> Data,
+    dispatch: @escaping @Sendable (ActivityKey, ActivityInvocation, ActivityOptions) async throws -> Data,
     recordEvent: @escaping @Sendable (WorkflowEvent) async throws -> Void,
     allocateSequence: @escaping @Sendable () async -> Int
   ) {
@@ -176,6 +176,10 @@ public struct WorkflowContext: Sendable {
     self.decoder = decoder
 
     let encoder = JSONEncoder()
+    // Activity cache keys are derived from these bytes — they must be
+    // stable across encode passes, or a replayed/re-tried call misses the
+    // journal. JSONEncoder key order is otherwise arbitrary.
+    encoder.outputFormatting = [.sortedKeys]
     encoder.userInfo[.actorSystemKey] = system
     self.encoder = encoder
   }
@@ -196,13 +200,18 @@ public struct WorkflowContext: Sendable {
     try Task.checkCancellation()
 
     let inputData = try encoder.encode(input)
-    let key = "\(ActivityType.name):\(inputData.base64EncodedString())"
+    let key = ActivityKey(name: ActivityType.name, inputData: inputData)
 
     if let cached = cachedOutcomes[key] {
       switch cached {
       case .success(let outputData):
         return try decoder.decode(ActivityType.Output.self, from: outputData)
       case .failure(let failure):
+        // A journaled failure from THIS run replays as the same failure —
+        // the workflow may have caught it and branched, so re-dispatching
+        // could diverge from history. (Failures from older runs never reach
+        // this cache — `_run` filters them out, which is what lets a
+        // retried attempt re-dispatch.)
         throw ApplicationError.typed(
           message: failure.message,
           type: failure.type,
@@ -414,12 +423,18 @@ public struct WorkflowContext: Sendable {
 
 public enum WorkflowEvent: Codable, Sendable {
   case executionStarted(inputData: Data)
-  case activitySucceeded(key: String, name: String, outputData: Data)
-  case activityFailed(key: String, name: String, failure: ActivityFailurePayload)
+  case activitySucceeded(key: ActivityKey, outputData: Data)
+  case activityFailed(key: ActivityKey, failure: ActivityFailurePayload)
   case timerScheduled(sequence: Int, duration: Duration, deadline: Date, summary: String?)
   case timerFired(sequence: Int)
   case timerCancelled(sequence: Int)
   case timestampRecorded(sequence: Int, date: Date)
+  /// The run's retry policy, journaled once when the first attempt starts.
+  case retryPolicyConfigured(RetryPolicy)
+  /// An attempt failed and a retry is scheduled at an absolute wall-clock
+  /// deadline. Status stays `.running`; resuming into a pending deadline
+  /// waits out only the remainder before starting the next attempt.
+  case retryScheduled(attempt: Int, deadline: Date)
   case executionCompleted(outputData: Data)
   case executionCancelled
   case executionFailed(message: String)
@@ -455,6 +470,16 @@ public struct WorkflowStatusInfo: Codable, Sendable {
   public let events: [WorkflowEvent]
 }
 
+/// Retry bookkeeping for a workflow. One optional — so a pending deadline or
+/// an attempt counter can never exist without the policy they belong to.
+struct RetryState: Codable, Sendable {
+  var policy: RetryPolicy
+  /// Number of retries scheduled so far (current attempt = this + 1).
+  var attempt: Int = 0
+  /// Set by `retryScheduled`, cleared when the next attempt starts.
+  var pendingDeadline: Date?
+}
+
 @EventSourced
 @VirtualActor
 public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
@@ -462,9 +487,9 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   public typealias Event = WorkflowEvent
 
   public struct Dependency: Codable, Sendable {
-    public let workflowID: String
+    public let workflowID: WorkflowID
 
-    public init(workflowID: String) {
+    public init(workflowID: WorkflowID) {
       self.workflowID = workflowID
     }
   }
@@ -472,19 +497,19 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   public struct State: Codable, Sendable {
     var status: WorkflowStatus = .idle
     var inputData: Data?
-    var activityOutcomes: [String: ActivityOutcomeRecord] = [:]
+    var activityOutcomes: [ActivityKey: ActivityOutcomeRecord] = [:]
     var timers: [Int: TimerState] = [:]
     var timestamps: [Int: ContinuousClock.Instant] = [:]
+    var retry: RetryState?
     var events: [WorkflowEvent] = []
-    var error: String?
   }
 
   public var state = State()
   private let encoder: JSONEncoder
   private let decoder: JSONDecoder
 
-  private let persistenceID: String
-  private let workflowID: String
+  private let persistenceID: WorkflowPersistenceID
+  private let workflowID: WorkflowID
   private let activityPool: WorkerPool<DurableActivityDispatchWorker<WorkflowType>>
   private var currentExecutionTask: Task<WorkflowResult<WorkflowType.Output>, Error>?
 
@@ -506,7 +531,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
 
   public init(actorSystem: ClusterSystem, dependency: Dependency) async throws {
     self.actorSystem = actorSystem
-    self.persistenceID = "\(WorkflowType.name)-\(dependency.workflowID)"
+    self.persistenceID = WorkflowPersistenceID(workflowType: WorkflowType.name, id: dependency.workflowID)
     self.workflowID = dependency.workflowID
 
     let encoder = JSONEncoder()
@@ -524,7 +549,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     )
     self.activityPool = try await WorkerPool(settings: poolSettings, actorSystem: actorSystem)
 
-    try await actorSystem.journal.register(actor: self, with: self.persistenceID)
+    try await actorSystem.journal.register(actor: self, with: self.persistenceID.rawValue)
 
     if case .running = self.state.status {
       Task { try? await self.resume() }
@@ -573,8 +598,18 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     }
   }
 
+  /// How a `_run` begins: a fresh run journals its start events from inside
+  /// the run task; a resumed run continues from the journaled state.
+  private enum RunStart {
+    case fresh(inputData: Data, retryPolicy: RetryPolicy?)
+    case resume
+  }
+
   @discardableResult
-  distributed public func execute(input: WorkflowType.Input) async throws -> WorkflowResult<WorkflowType.Output> {
+  distributed public func execute(
+    input: WorkflowType.Input,
+    retryPolicy: RetryPolicy? = nil
+  ) async throws -> WorkflowResult<WorkflowType.Output> {
     let inputData = try self.encoder.encode(input)
     if let previousInputData = self.state.inputData, previousInputData != inputData {
       throw WorkflowRuntimeError.workflowInputMismatch
@@ -591,21 +626,58 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     case .cancelled:
       throw WorkflowRuntimeError.workflowCancelled
     case .idle, .failed:
-      break
+      // A concurrent `execute` may already be starting this workflow: its run
+      // task was created synchronously, but `executionStarted` hasn't reached
+      // the journal yet, so the status still reads `.idle`/`.failed`. Join
+      // the in-flight task — never start a sibling run.
+      if let task = self.currentExecutionTask { return try await task.value }
     }
 
-    try await self.emit(event: .executionStarted(inputData: inputData))
-    return try await self._run(input: input)
+    return try await self._run(
+      input: input,
+      start: .fresh(inputData: inputData, retryPolicy: retryPolicy)
+    )
   }
 
-  private func _run(input: WorkflowType.Input) async throws -> WorkflowResult<WorkflowType.Output> {
+  private func _run(
+    input: WorkflowType.Input,
+    start: RunStart = .resume
+  ) async throws -> WorkflowResult<WorkflowType.Output> {
     // A run — fresh or replayed — numbers its journaled operations from 0
     // in call order.
     self.operationSequenceCursor = 0
     let workflowTask = Task {
+      switch start {
+      case .fresh(let inputData, let retryPolicy):
+        // Journal the run boundary (and the retry policy) BEFORE the body
+        // runs, so a crash between start and the first activity still
+        // resumes correctly.
+        try await self.emit(event: .executionStarted(inputData: inputData))
+        if let retryPolicy {
+          try await self.emit(event: .retryPolicyConfigured(retryPolicy))
+        }
+      case .resume:
+        // Retry backoff: the next attempt was scheduled at a journaled
+        // absolute deadline. Wait out only the remainder (crash-resume into a
+        // pending backoff lands here too), then mark the new attempt with a
+        // fresh executionStarted — the run boundary that lets the previously
+        // failed activity re-dispatch.
+        if let deadline = self.state.retry?.pendingDeadline {
+          try await Task.sleep(until: deadline.continuousClockInstant, clock: .continuous)
+          guard case .running = self.state.status, let inputData = self.state.inputData else {
+            throw CancellationError()
+          }
+          try await self.emit(event: .executionStarted(inputData: inputData))
+        }
+      }
+
+      let cachedOutcomes = currentRunCachedOutcomes(
+        events: self.state.events,
+        outcomes: self.state.activityOutcomes
+      )
       let workflow = WorkflowType()
       let context = WorkflowContext(
-        cachedOutcomes: self.state.activityOutcomes,
+        cachedOutcomes: cachedOutcomes,
         cachedTimers: self.state.timers,
         cachedTimestamps: self.state.timestamps,
         workflowID: self.workflowID,
@@ -617,7 +689,6 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
             try await self.emit(
               event: .activitySucceeded(
                 key: key,
-                name: invocation.name,
                 outputData: outputData
               )
             )
@@ -626,7 +697,6 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
             try await self.emit(
               event: .activityFailed(
                 key: key,
-                name: invocation.name,
                 failure: failure
               )
             )
@@ -652,14 +722,6 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
         // `cancel()` already emitted `.executionCancelled` — a cancelled
         // workflow must not be turned into a failed one here.
         throw CancellationError()
-      } catch let appError as ApplicationError {
-        if case .typed(let message, _, _) = appError {
-          try await self.emit(event: .executionFailed(message: message))
-        }
-        throw appError
-      } catch {
-        try await self.emit(event: .executionFailed(message: error.localizedDescription))
-        throw error
       }
     }
 
@@ -671,17 +733,54 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
       // distributed call's reply is delivered before the actor disappears;
       // reactivation on the next call just replays the journal.
       switch self.state.status {
-      case .completed, .cancelled:
+      case .completed, .cancelled, .failed:
         Task { try? await self.actorSystem.virtualActors.deactivate(self) }
-      case .idle, .running, .failed:
+      case .idle, .running:
         break
       }
     }
 
-    return try await withTaskCancellationHandler {
-      try await workflowTask.value
-    } onCancel: {
-      workflowTask.cancel()
+    do {
+      return try await withTaskCancellationHandler {
+        try await workflowTask.value
+      } onCancel: {
+        workflowTask.cancel()
+      }
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch {
+      return try await self.handleRunFailure(error, input: input)
+    }
+  }
+
+  /// Decides between retrying and failing a thrown run, then performs the
+  /// decision: the decision itself is pure (`decideOnRunFailure`); this shell
+  /// only journals what it says. A retry schedules the next attempt at a
+  /// journaled absolute deadline and recurses into `_run`, whose prologue
+  /// waits out only the remaining backoff — so a crash mid-backoff loses
+  /// nothing.
+  private func handleRunFailure(
+    _ error: Error,
+    input: WorkflowType.Input
+  ) async throws -> WorkflowResult<WorkflowType.Output> {
+    // A concurrent cancel/terminal transition wins over retrying or failing.
+    // (A fresh start whose `executionStarted` never reached the journal is
+    // still `.idle` here — surface the original store error, not a phantom
+    // cancellation.)
+    guard case .running = self.state.status else {
+      if case .cancelled = self.state.status {
+        throw CancellationError()
+      }
+      throw error
+    }
+
+    switch decideOnRunFailure(error: error, retry: self.state.retry, now: Date()) {
+    case .fail(let message):
+      try await self.emit(event: .executionFailed(message: message))
+      throw error
+    case .retry(let attempt, let deadline):
+      try await self.emit(event: .retryScheduled(attempt: attempt, deadline: deadline))
+      return try await self._run(input: input)
     }
   }
 
@@ -707,10 +806,22 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     case .executionStarted(let inputData):
       self.state.status = .running
       self.state.inputData = inputData
-      self.state.error = nil
-    case .activitySucceeded(let key, _, let outputData):
+      self.state.retry?.pendingDeadline = nil
+    case .retryPolicyConfigured(let policy):
+      if self.state.retry != nil {
+        self.state.retry?.policy = policy
+      } else {
+        self.state.retry = RetryState(policy: policy)
+      }
+    case .retryScheduled(let attempt, let deadline):
+      // Only meaningful with a policy in place — `handleRunFailure` never
+      // emits one otherwise, and the grouped state makes the combination
+      // "deadline without policy" unrepresentable.
+      self.state.retry?.attempt = attempt
+      self.state.retry?.pendingDeadline = deadline
+    case .activitySucceeded(let key, let outputData):
       self.state.activityOutcomes[key] = .success(outputData: outputData)
-    case .activityFailed(let key, _, let failure):
+    case .activityFailed(let key, let failure):
       self.state.activityOutcomes[key] = .failure(failure)
     case .timerScheduled(let sequence, let duration, let deadline, let summary):
       self.state.timers[sequence] = .scheduled(duration: duration, deadline: deadline, summary: summary)
@@ -722,10 +833,8 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
       self.state.timestamps[sequence] = date.continuousClockInstant
     case .executionCompleted(let outputData):
       self.state.status = .completed(data: outputData)
-      self.state.error = nil
     case .executionFailed(let message):
       self.state.status = .failed(error: message)
-      self.state.error = message
     case .executionCancelled:
       self.state.status = .cancelled
     }

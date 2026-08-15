@@ -38,7 +38,7 @@ public actor DurableWorkflowsPlugin: Plugin {
     let actor = try await self.getActor(WorkflowType.self, options: options)
     try? await self.registry.trackStarted(id: options.id, workflowType: WorkflowType.name)
     defer { Task { try? await self.registry.trackFinished(id: options.id) } }
-    let result = try await actor.execute(input: input)
+    let result = try await actor.execute(input: input, retryPolicy: options.retryPolicy)
     return result.output
   }
 
@@ -74,7 +74,9 @@ public actor DurableWorkflowsPlugin: Plugin {
       workflowID: options.id
     )
     return try await self.actorSystem.virtualActors.getActor(
-      identifiedBy: .init(rawValue: "\(WorkflowType.name)-\(options.id)"),
+      identifiedBy: .init(
+        rawValue: WorkflowPersistenceID(workflowType: WorkflowType.name, id: options.id).rawValue
+      ),
       dependency: dependency
     )
   }
