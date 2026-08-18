@@ -103,7 +103,14 @@ public struct FlakyWorkflow {
   public typealias Activities = FlakyActivities
 
   public struct Input: Codable, Sendable {
-    public init() {}
+    /// Varies the encoded input so tests can submit a genuinely NEW input to
+    /// a workflow that already has history (the demo's shape: a fresh
+    /// Connection actor per submission).
+    public var label: String
+
+    public init(label: String = "") {
+      self.label = label
+    }
   }
 
   public init() {}

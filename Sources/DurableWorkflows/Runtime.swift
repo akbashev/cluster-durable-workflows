@@ -97,6 +97,8 @@ public distributed actor DurableActivityDispatchWorker<WorkflowType: WorkflowPro
       case .typed(let message, let type, let isNonRetryable):
         return .failure(.init(message: message, type: type, isNonRetryable: isNonRetryable))
       }
+    } catch let error as CancellationError {
+      throw error
     } catch {
       return .failure(.init(message: error.localizedDescription, type: "ActivityError", isNonRetryable: false))
     }
@@ -611,21 +613,29 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     retryPolicy: RetryPolicy? = nil
   ) async throws -> WorkflowResult<WorkflowType.Output> {
     let inputData = try self.encoder.encode(input)
-    if let previousInputData = self.state.inputData, previousInputData != inputData {
-      throw WorkflowRuntimeError.workflowInputMismatch
-    }
-
     switch self.state.status {
     case .completed(let outputData):
+      // Returning a cached result is only meaningful for the SAME input.
+      if let previousInputData = self.state.inputData, previousInputData != inputData {
+        throw WorkflowRuntimeError.workflowInputMismatch
+      }
       if let output = try? self.decoder.decode(WorkflowType.Output.self, from: outputData) {
         return WorkflowResult(output: output)
       }
     case .running:
+      // Joining an in-flight run is only meaningful for the SAME input.
+      if let previousInputData = self.state.inputData, previousInputData != inputData {
+        throw WorkflowRuntimeError.workflowInputMismatch
+      }
       if let task = self.currentExecutionTask { return try await task.value }
       return try await self._run(input: input)
     case .cancelled:
       throw WorkflowRuntimeError.workflowCancelled
     case .idle, .failed:
+      // A fresh start — from `.idle`, or a caller-initiated restart of a
+      // `.failed` workflow — takes whatever input the caller passes; the new
+      // `executionStarted` replaces the journaled input.
+      //
       // A concurrent `execute` may already be starting this workflow: its run
       // task was created synchronously, but `executionStarted` hasn't reached
       // the journal yet, so the status still reads `.idle`/`.failed`. Join
@@ -741,13 +751,19 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
     }
 
     do {
-      return try await withTaskCancellationHandler {
-        try await workflowTask.value
-      } onCancel: {
-        workflowTask.cancel()
-      }
-    } catch is CancellationError {
-      throw CancellationError()
+      // The run outlives any single caller: awaiting a task's value never
+      // cancels the task, so a caller disconnecting (SSE close, cancelled
+      // client task) stops WAITING without killing the run. The only way to
+      // stop a run is `cancel()`, which cancels `currentExecutionTask`
+      // directly. (Previously a cancellation handler propagated caller
+      // cancellation into the run — a browser tab closing mid-backoff left
+      // the workflow `.running` with no live task, parked forever.)
+      return try await workflowTask.value
+    } catch let error as CancellationError {
+      // Divert cancellation away from `handleRunFailure`: `cancel()` already
+      // journaled `.executionCancelled`, so the run must not be retried or
+      // marked failed — just propagate.
+      throw error
     } catch {
       return try await self.handleRunFailure(error, input: input)
     }
@@ -808,8 +824,14 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
       self.state.inputData = inputData
       self.state.retry?.pendingDeadline = nil
     case .retryPolicyConfigured(let policy):
+      // Emitted only by a caller-initiated fresh start (`_run(.fresh)`) — the
+      // automatic retry loop never journals it. So this marks a NEW attempt
+      // budget: a manual re-execute of a failed workflow retries afresh under
+      // the given policy instead of inheriting the exhausted counter.
       if self.state.retry != nil {
         self.state.retry?.policy = policy
+        self.state.retry?.attempt = 0
+        self.state.retry?.pendingDeadline = nil
       } else {
         self.state.retry = RetryState(policy: policy)
       }

@@ -276,6 +276,122 @@ struct RetryWorkflowTests {
     _ = worker
   }
 
+  /// A cancelled CALLER (SSE disconnect, closed tab) must not kill the run:
+  /// the workflow belongs to the journal, not to whichever task happened to
+  /// start it. Regression test for the demo failure where closing the stream
+  /// mid-backoff left the workflow `.running` with no live task — parked
+  /// forever.
+  @Test
+  func callerCancellationDoesNotKillTheRun() async throws {
+    let (system, node, worker) = try await makeFlakyWorkflowSystem(
+      name: "flaky-caller-cancel",
+      port: 4611,
+      store: InMemoryEventStore()
+    )
+    let options = WorkflowOptions(
+      id: "wf-caller-cancel",
+      retryPolicy: RetryPolicy(initialInterval: .milliseconds(100), maximumAttempts: 2)
+    )
+    InvocationCounter.shared.reset("flaky")
+    FlakySwitch.shared.failuresRemaining = 1
+    defer { FlakySwitch.shared.failuresRemaining = 0 }
+
+    let execution = Task {
+      try await system.workflows.execute(type: FlakyWorkflow.self, options: options, input: .init())
+    }
+
+    // Wait until the failed attempt has journaled its retry — the run is now
+    // parked in backoff — then cancel the CALLER, not the workflow.
+    try await eventually(interval: .milliseconds(50)) {
+      let info = try await system.workflows.getStatus(type: FlakyWorkflow.self, options: options)
+      return info.events.contains { event in
+        if case .retryScheduled = event { return true }
+        return false
+      }
+    }
+    execution.cancel()
+
+    // The run survives its caller: the backoff fires, the retry re-dispatches,
+    // and the workflow completes.
+    try await eventually(interval: .milliseconds(100)) {
+      let info = try await system.workflows.getStatus(type: FlakyWorkflow.self, options: options)
+      if case .completed = info.status { return true }
+      return false
+    }
+    #expect(InvocationCounter.shared.count("flaky") == 2)
+
+    _ = node
+    _ = worker
+  }
+
+  /// Pressing "start again" on a failed workflow — with a NEW input, as any
+  /// real caller has (the demo's Connection actor differs per submission) —
+  /// must start a fresh run, not throw `workflowInputMismatch`. The fresh run
+  /// also gets a fresh retry budget: `retryPolicyConfigured` marks a
+  /// caller-initiated start and resets the exhausted attempt counter.
+  @Test
+  func executeFromFailedWithNewInputStartsFreshRunWithFreshRetryBudget() async throws {
+    let (system, node, worker) = try await makeFlakyWorkflowSystem(
+      name: "flaky-restart",
+      port: 4610,
+      store: InMemoryEventStore()
+    )
+    let options = WorkflowOptions(
+      id: "wf-restart",
+      retryPolicy: RetryPolicy(initialInterval: .milliseconds(50), maximumAttempts: 2)
+    )
+
+    // Exhaust the policy: attempt 1 + retry 1 both fail, run goes terminal.
+    InvocationCounter.shared.reset("flaky")
+    FlakySwitch.shared.failuresRemaining = 10
+    await #expect(throws: ApplicationError.self) {
+      try await system.workflows.execute(
+        type: FlakyWorkflow.self,
+        options: options,
+        input: .init(label: "v1")
+      )
+    }
+    #expect(InvocationCounter.shared.count("flaky") == 2)
+    let failed = try await system.workflows.getStatus(type: FlakyWorkflow.self, options: options)
+    guard case .failed = failed.status else {
+      Issue.record("expected failed, got \(failed.status)")
+      return
+    }
+
+    // Re-execute with NEW input and one failure left: the fresh budget turns
+    // it into fail-then-succeed. Without the budget reset this would fail
+    // terminally on the first error; before the input-guard fix it threw
+    // `workflowInputMismatch` instead of running at all.
+    FlakySwitch.shared.failuresRemaining = 1
+    defer { FlakySwitch.shared.failuresRemaining = 0 }
+    let output = try await system.workflows.execute(
+      type: FlakyWorkflow.self,
+      options: options,
+      input: .init(label: "v2")
+    )
+    #expect(output == "ok")
+    #expect(InvocationCounter.shared.count("flaky") == 4)
+
+    let info = try await system.workflows.getStatus(type: FlakyWorkflow.self, options: options)
+    guard case .completed = info.status else {
+      Issue.record("expected completed, got \(info.status)")
+      return
+    }
+    let starts = info.events.filter {
+      if case .executionStarted = $0 { return true }
+      return false
+    }
+    let policies = info.events.filter {
+      if case .retryPolicyConfigured = $0 { return true }
+      return false
+    }
+    #expect(starts.count == 4)  // two attempts per run, two runs
+    #expect(policies.count == 2)  // one per caller-initiated run
+
+    _ = node
+    _ = worker
+  }
+
   /// The other side of the failure-replay contract: resuming the SAME run
   /// that caught an activity failure and continued must rethrow the journaled
   /// failure — never re-dispatch — or the replay can take a different branch
