@@ -4,7 +4,7 @@
 
 Please visit the DurableWorkflows web site for more information:
 
-  * https://github.com/akbashev/durable-workflows
+  * https://github.com/akbashev/cluster-durable-workflows
 
 Copyright 2024 The DurableWorkflows Project Authors
 
@@ -53,4 +53,3 @@ This project builds on top of:
     * https://github.com/swiftlang/swift-syntax/blob/main/LICENSE.txt
   * HOMEPAGE:
     * https://github.com/swiftlang/swift-syntax
-
