@@ -29,6 +29,49 @@ public actor DurableWorkflowsPlugin: Plugin {
     self.registry = nil
   }
 
+  public func schedule<WorkflowType: WorkflowProtocol>(
+    id: ScheduleID,
+    recurrence: Calendar.RecurrenceRule,
+    workflow: WorkflowType.Type,
+    input: WorkflowType.Input,
+    retryPolicy: RetryPolicy? = nil,
+    overlapPolicy: ScheduleOverlapPolicy = .allow
+  ) async throws {
+    try await self
+      .scheduler(for: WorkflowType.self, id: id)
+      .schedule(
+        recurrence: recurrence,
+        input: input,
+        retryPolicy: retryPolicy,
+        overlapPolicy: overlapPolicy
+      )
+  }
+
+  public func cancelSchedule<WorkflowType: WorkflowProtocol>(id: ScheduleID, workflow: WorkflowType.Type) async throws {
+    try await self.scheduler(for: WorkflowType.self, id: id).cancel()
+  }
+
+  public func describeSchedule<WorkflowType: WorkflowProtocol>(
+    id: ScheduleID,
+    workflow: WorkflowType.Type
+  ) async throws -> ScheduleDescription? {
+    try await self.scheduler(for: WorkflowType.self, id: id).describe()
+  }
+
+  private func scheduler<WorkflowType: WorkflowProtocol>(for type: WorkflowType.Type, id: ScheduleID) async throws -> WorkflowScheduler<WorkflowType> {
+    try await self.actorSystem.virtualActors.getActor(
+      identifiedBy: .init(
+        rawValue: SchedulePersistenceID(
+          workflowType: WorkflowType.name,
+          scheduleID: id
+        ).rawValue
+      ),
+      dependency: WorkflowScheduler<WorkflowType>.Dependency(
+        scheduleID: id
+      )
+    )
+  }
+
   @discardableResult
   public func execute<WorkflowType: WorkflowProtocol>(
     type: WorkflowType.Type,
@@ -70,14 +113,13 @@ public actor DurableWorkflowsPlugin: Plugin {
     _ type: WorkflowType.Type,
     options: WorkflowOptions
   ) async throws -> WorkflowActor<WorkflowType> {
-    let dependency = WorkflowActor<WorkflowType>.Dependency(
-      workflowID: options.id
-    )
-    return try await self.actorSystem.virtualActors.getActor(
+    try await self.actorSystem.virtualActors.getActor(
       identifiedBy: .init(
         rawValue: WorkflowPersistenceID(workflowType: WorkflowType.name, id: options.id).rawValue
       ),
-      dependency: dependency
+      dependency: WorkflowActor<WorkflowType>.Dependency(
+        workflowID: options.id
+      )
     )
   }
 }

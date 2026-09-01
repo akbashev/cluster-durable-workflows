@@ -133,6 +133,55 @@ let output = try await system.workflows.execute(
 print(output.chargeId)
 ```
 
+### Schedule recurring workflows
+
+Schedules are durable virtual actors backed by the same event store as workflow executions. A schedule is identified by an explicit `ScheduleID`, and its recurrence is evaluated in the supplied calendar (including time zone and daylight-saving rules):
+
+```swift
+var calendar = Calendar(identifier: .gregorian)
+calendar.timeZone = TimeZone(identifier: "Europe/Berlin")!
+
+let recurrence = Calendar.RecurrenceRule.daily(
+    calendar: calendar,
+    hours: [8],
+    minutes: [30]
+)
+
+try await system.workflows.schedule(
+    id: "daily-report",
+    recurrence: recurrence,
+    workflow: OrderWorkflow.self,
+    input: .init(orderId: "daily", email: "reports@example.com", amountCents: 0)
+)
+```
+
+Calling `schedule` again with the same ID is idempotent. Schedules can be cancelled or inspected without starting a workflow run:
+
+```swift
+let description = try await system.workflows.describeSchedule(
+    id: "daily-report",
+    workflow: OrderWorkflow.self
+)
+print(description?.nextFireAt as Any)
+
+try await system.workflows.cancelSchedule(
+    id: "daily-report",
+    workflow: OrderWorkflow.self
+)
+```
+
+If a recurrence fires while its previous workflow is still active, the default `.allow` policy starts a separate occurrence. Pass `.skip` to advance past overlapping occurrences instead:
+
+```swift
+try await system.workflows.schedule(
+    id: "daily-report",
+    recurrence: recurrence,
+    workflow: OrderWorkflow.self,
+    input: .init(orderId: "daily", email: "reports@example.com", amountCents: 0),
+    overlapPolicy: .skip
+)
+```
+
 ### Status
 
 ```swift
@@ -236,10 +285,9 @@ Trade-offs of the simple model:
 Things deliberately not built yet, in rough priority order:
 
 1. **Activity-level retry policies** — `ActivityOptions` is accepted but ignored today. Temporal's workhorse is retrying the *activity* (with its own backoff) so transient failures never fail the workflow at all; our `retryPolicy` only retries whole runs.
-2. **Scheduler/timer service actor** — scan journaled `timerScheduled` deadlines and wake workflows at fire time, Temporal-style. Unlocks evicting long-sleeping workflows from memory. Only worth it if timer volume justifies it.
-3. **Node-down timer recovery** — when a cluster member leaves for good, nothing re-homes its pending timers today (`recoverAll` covers node *restart*). Needs a scan-on-member-down plus a slow periodic sweep; folds into the planned Raft work in `distributed-actors` (split-brain safety is a prerequisite — two nodes must never resume the same timer).
-4. **Deterministic executor for concurrent sleeps** — sequence allocation across task groups is arrival-order today; full Temporal semantics need deterministic scheduling or a richer command-history model.
-5. **Cancellation shielding** (`withCancellationShield`-style) for compensation blocks — Temporal has it; our README workaround is a detached `Task`.
+2. **Node-down timer recovery** — when a cluster member leaves for good, nothing re-homes its pending timers today (`recoverAll` covers node *restart*). Needs a scan-on-member-down plus a slow periodic sweep; folds into the planned Raft work in `distributed-actors` (split-brain safety is a prerequisite — two nodes must never resume the same timer).
+3. **Deterministic executor for concurrent sleeps** — sequence allocation across task groups is arrival-order today; full Temporal semantics need deterministic scheduling or a richer command-history model.
+4. **Cancellation shielding** (`withCancellationShield`-style) for compensation blocks — Temporal has it; our README workaround is a detached `Task`.
 
 ## Durability
 

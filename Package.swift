@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
   name: "durable-workflows",
   platforms: [
-    .macOS("26.0")
+    .macOS("26.4")
   ],
   products: [
     .library(name: "DurableWorkflows", targets: ["DurableWorkflows"])
