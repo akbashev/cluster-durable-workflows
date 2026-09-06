@@ -472,6 +472,12 @@ public struct WorkflowStatusInfo: Codable, Sendable {
   public let events: [WorkflowEvent]
 }
 
+public enum WorkflowStartOutcome: Codable, Sendable, Equatable {
+  case started
+  case alreadyRunning
+  case alreadyCompleted
+}
+
 /// Retry bookkeeping for a workflow. One optional — so a pending deadline or
 /// an attempt counter can never exist without the policy they belong to.
 struct RetryState: Codable, Sendable {
@@ -577,7 +583,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   /// orphan — nothing would wake the actor at the timer's deadline.
   public func shouldDeactivate() async -> Bool {
     if case .running = self.state.status { return false }
-    return true
+    return self.currentExecutionTask == nil
   }
 
   @discardableResult
@@ -647,6 +653,51 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
       input: input,
       start: .fresh(inputData: inputData, retryPolicy: retryPolicy)
     )
+  }
+
+  /// Starts a workflow and returns after its execution has been handed to the
+  /// workflow actor. The execution task is owned by this actor, so the caller
+  /// may disconnect without cancelling a timer or background action.
+  ///
+  /// This is intentionally separate from `execute`: callers that need the
+  /// result should join with `execute`, while scheduling tools need an
+  /// acceptance boundary and must not wait until a future timer fires.
+  distributed public func start(
+    input: WorkflowType.Input,
+    retryPolicy: RetryPolicy? = nil
+  ) async throws -> WorkflowStartOutcome {
+    let inputData = try self.encoder.encode(input)
+    switch self.state.status {
+    case .completed:
+      if let previousInputData = self.state.inputData, previousInputData != inputData {
+        throw WorkflowRuntimeError.workflowInputMismatch
+      }
+      return .alreadyCompleted
+    case .running:
+      if let previousInputData = self.state.inputData, previousInputData != inputData {
+        throw WorkflowRuntimeError.workflowInputMismatch
+      }
+      return .alreadyRunning
+    case .cancelled:
+      throw WorkflowRuntimeError.workflowCancelled
+    case .idle, .failed:
+      if let task = self.currentExecutionTask {
+        if let previousInputData = self.state.inputData, previousInputData != inputData {
+          throw WorkflowRuntimeError.workflowInputMismatch
+        }
+        _ = task
+        return .alreadyRunning
+      }
+    }
+
+    let task = Task {
+      try await self._run(
+        input: input,
+        start: .fresh(inputData: inputData, retryPolicy: retryPolicy)
+      )
+    }
+    self.currentExecutionTask = task
+    return .started
   }
 
   private func _run(
@@ -744,7 +795,13 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
       // reactivation on the next call just replays the journal.
       switch self.state.status {
       case .completed, .cancelled, .failed:
-        Task { try? await self.actorSystem.virtualActors.deactivate(self) }
+        Task {
+          await self.actorSystem.workflows.workflowDidFinish(
+            id: self.workflowID,
+            typeName: WorkflowType.name
+          )
+          try? await self.actorSystem.virtualActors.deactivate(self)
+        }
       case .idle, .running:
         break
       }
