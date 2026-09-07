@@ -3,6 +3,18 @@ import DistributedCluster
 import Foundation
 import VirtualActors
 
+public struct WorkflowDescription: Codable, Sendable {
+  public let id: WorkflowID
+  public let status: WorkflowStatus
+  public let inputData: Data?
+
+  public init(id: WorkflowID, status: WorkflowStatus, inputData: Data?) {
+    self.id = id
+    self.status = status
+    self.inputData = inputData
+  }
+}
+
 public actor DurableWorkflowsPlugin: Plugin {
   public static let pluginKey: Key = "$durableWorkflows"
 
@@ -78,6 +90,101 @@ public actor DurableWorkflowsPlugin: Plugin {
     workflow: WorkflowType.Type
   ) async throws -> ScheduleDescription? {
     try await self.scheduler(for: WorkflowType.self, id: id).describe()
+  }
+
+  /// Triggers one occurrence now without moving the recurring schedule's
+  /// calendar cursor. The schedule's next planned occurrence is unchanged.
+  public func triggerSchedule<WorkflowType: WorkflowProtocol>(
+    id: ScheduleID,
+    workflow: WorkflowType.Type
+  ) async throws -> ScheduleTriggerOutcome {
+    try await self.scheduler(for: WorkflowType.self, id: id).trigger()
+  }
+
+  /// Lists the schedules registered for one workflow type. Stale registry
+  /// entries are omitted; recovery remains responsible for cleaning them up.
+  public func listSchedules<WorkflowType: WorkflowProtocol>(
+    workflow: WorkflowType.Type
+  ) async throws -> [ScheduleDescription] {
+    let registrations = try await self.registry.registrations()
+    let ids = registrations.compactMap { registration -> ScheduleID? in
+      guard case .schedule(let id, let typeName) = registration,
+        typeName == WorkflowType.name
+      else {
+        return nil
+      }
+      return id
+    }
+
+    return try await withThrowingTaskGroup(of: ScheduleDescription?.self) { group in
+      for id in ids {
+        group.addTask {
+          try? await self.describeSchedule(id: id, workflow: WorkflowType.self)
+        }
+      }
+
+      var descriptions = [ScheduleDescription]()
+      for try await description in group {
+        if let description {
+          descriptions.append(description)
+        }
+      }
+      return descriptions.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+  }
+
+  /// Lists registered workflow executions for one workflow type. The input is
+  /// intentionally opaque at this generic boundary; the owning domain decodes
+  /// it into its own request type.
+  public func listWorkflows<WorkflowType: WorkflowProtocol>(
+    workflow: WorkflowType.Type
+  ) async throws -> [WorkflowDescription] {
+    let registrations = try await self.registry.registrations()
+    let ids = registrations.compactMap { registration -> WorkflowID? in
+      guard case .workflow(let id, let typeName) = registration,
+        typeName == WorkflowType.name
+      else {
+        return nil
+      }
+      return id
+    }
+
+    return try await withThrowingTaskGroup(of: WorkflowDescription?.self) { group in
+      for id in ids {
+        group.addTask {
+          guard
+            let actor = try? await self.getActor(
+              WorkflowType.self,
+              options: WorkflowOptions(id: id)
+            )
+          else {
+            return nil
+          }
+          guard let status = try? await actor.getStatus() else {
+            return nil
+          }
+          let inputData = status.events.reversed().compactMap { event -> Data? in
+            guard case .executionStarted(let inputData) = event else {
+              return nil
+            }
+            return inputData
+          }.first
+          return WorkflowDescription(
+            id: id,
+            status: status.status,
+            inputData: inputData
+          )
+        }
+      }
+
+      var descriptions = [WorkflowDescription]()
+      for try await description in group {
+        if let description {
+          descriptions.append(description)
+        }
+      }
+      return descriptions.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
   }
 
   private func scheduler<WorkflowType: WorkflowProtocol>(for type: WorkflowType.Type, id: ScheduleID) async throws -> WorkflowScheduler<WorkflowType> {
@@ -159,14 +266,15 @@ public actor DurableWorkflowsPlugin: Plugin {
 
   public func recoverAll<WorkflowType: WorkflowProtocol>(ofType type: WorkflowType.Type) async throws {
     for registration in try await self.registry.registrations()
-      where registration.typeName == WorkflowType.name
-    {
+    where registration.typeName == WorkflowType.name {
       switch registration {
       case .workflow(let id, _):
-        guard let actor = try? await self.getActor(
-          WorkflowType.self,
-          options: WorkflowOptions(id: id)
-        ) else { continue }
+        guard
+          let actor = try? await self.getActor(
+            WorkflowType.self,
+            options: WorkflowOptions(id: id)
+          )
+        else { continue }
         guard let status = try? await actor.getStatus() else { continue }
         switch status.status {
         case .running:
@@ -175,10 +283,12 @@ public actor DurableWorkflowsPlugin: Plugin {
           try? await self.registry.unregister(registration)
         }
       case .schedule(let id, _):
-        guard let scheduler = try? await self.scheduler(
-          for: WorkflowType.self,
-          id: id
-        ) else { continue }
+        guard
+          let scheduler = try? await self.scheduler(
+            for: WorkflowType.self,
+            id: id
+          )
+        else { continue }
         do {
           guard try await scheduler.describe() != nil else {
             try? await self.registry.unregister(registration)

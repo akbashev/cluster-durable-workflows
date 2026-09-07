@@ -60,13 +60,22 @@ public enum ScheduleOverlapPolicy: Codable, Sendable {
 public struct ScheduleOccurrenceID: Hashable, Codable, Sendable, CustomStringConvertible {
   public let scheduleID: ScheduleID
   public let scheduledAt: Date
+  public let triggerID: UUID?
 
-  public init(scheduleID: ScheduleID, scheduledAt: Date) {
+  public init(
+    scheduleID: ScheduleID,
+    scheduledAt: Date,
+    triggerID: UUID? = nil
+  ) {
     self.scheduleID = scheduleID
     self.scheduledAt = scheduledAt
+    self.triggerID = triggerID
   }
 
   public var description: String {
+    if let triggerID {
+      return "\(scheduleID)-trigger-\(triggerID.uuidString)"
+    }
     let milliseconds = Int64((scheduledAt.timeIntervalSince1970 * 1_000).rounded())
     return "\(scheduleID)-\(milliseconds)"
   }
@@ -81,8 +90,7 @@ public struct ScheduledWorkflowOccurrence: Codable, Sendable {
   public let scheduledAt: Date
 
   public var workflowID: WorkflowID {
-    let milliseconds = Int64((scheduledAt.timeIntervalSince1970 * 1_000).rounded())
-    return WorkflowID(rawValue: "schedule-\(scheduleID)-\(milliseconds)")
+    WorkflowID(rawValue: "schedule-\(id.description)")
   }
 }
 
@@ -90,11 +98,21 @@ public struct ScheduleDescription: Codable, Sendable {
   public let id: ScheduleID
   public let recurrence: Calendar.RecurrenceRule
   public let workflowType: String
+  public let inputData: Data
   public let createdAt: Date
   public let lastFiredAt: Date?
   public let nextFireAt: Date?
   public let nextFireIn: Duration?
   public let executions: [ScheduleExecutionState]
+}
+
+public enum ScheduleTriggerOutcome: Codable, Sendable, Equatable {
+  case triggered
+  case skipped
+}
+
+public enum ScheduleRuntimeError: Error, Codable, Sendable, Equatable {
+  case scheduleNotFound(ScheduleID)
 }
 
 public enum ScheduleExecutionState: Codable, Sendable, Equatable {
@@ -124,6 +142,7 @@ public enum WorkflowSchedulerEvent: Codable, Sendable {
   case cancelled
   case occurrenceClaimed(ScheduledWorkflowOccurrence)
   case occurrenceSkipped(ScheduledWorkflowOccurrence)
+  case occurrenceTriggered(ScheduledWorkflowOccurrence)
   case occurrenceStarted(ScheduledWorkflowOccurrence)
   case occurrenceFinished(id: ScheduleOccurrenceID)
 }
@@ -186,7 +205,10 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
     retryPolicy: RetryPolicy?,
     overlapPolicy: ScheduleOverlapPolicy = .allow
   ) async throws {
-    guard state.schedule == nil else { rearm(); return }
+    guard state.schedule == nil else {
+      rearm()
+      return
+    }
     let inputData = try encoder.encode(input)
     try await emit(
       event: .scheduled(
@@ -208,7 +230,33 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
   distributed public func cancel() async throws {
     guard state.schedule != nil else { return }
     try await emit(event: .cancelled)
-    timerTask?.cancel(); timerTask = nil
+    timerTask?.cancel()
+    timerTask = nil
+  }
+
+  /// Runs one occurrence immediately without advancing the recurring
+  /// schedule. The next calendar occurrence remains the next calendar
+  /// occurrence after this call.
+  distributed public func trigger() async throws -> ScheduleTriggerOutcome {
+    guard let schedule = state.schedule else {
+      throw ScheduleRuntimeError.scheduleNotFound(scheduleID)
+    }
+
+    let occurrence = Self.occurrence(
+      for: schedule,
+      at: .now,
+      triggerID: UUID()
+    )
+    guard schedule.overlapPolicy != .skip || state.executions.isEmpty else {
+      return .skipped
+    }
+
+    // This is scheduler state, not workflow history. It records that the
+    // manual occurrence was accepted so a crash after this point can recover
+    // and dispatch it from the scheduler journal.
+    try await emit(event: .occurrenceTriggered(occurrence))
+    await dispatch(occurrence)
+    return .triggered
   }
 
   distributed public func describe() -> ScheduleDescription? {
@@ -217,6 +265,7 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
       id: schedule.id,
       recurrence: schedule.recurrence,
       workflowType: schedule.workflowType,
+      inputData: schedule.inputData,
       createdAt: schedule.startedAt,
       lastFiredAt: schedule.lastFiredAt,
       nextFireAt: Self.nextFireDate(for: schedule),
@@ -226,11 +275,12 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
   }
 
   public func shouldDeactivate() async -> Bool {
-    return state.schedule == nil && state.executions.isEmpty && timerTask == nil
+    state.schedule == nil && state.executions.isEmpty && timerTask == nil
   }
 
   private func rearm() {
-    timerTask?.cancel(); timerTask = nil
+    timerTask?.cancel()
+    timerTask = nil
     guard let schedule = state.schedule, let deadline = Self.nextFireDate(for: schedule) else { return }
     timerTask = Task {
       do {
@@ -243,7 +293,10 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
 
   private func deadlineReached() async {
     timerTask = nil
-    guard let schedule = state.schedule, let scheduledAt = Self.nextFireDate(for: schedule), scheduledAt <= .now else { rearm(); return }
+    guard let schedule = state.schedule, let scheduledAt = Self.nextFireDate(for: schedule), scheduledAt <= .now else {
+      rearm()
+      return
+    }
     let occurrence = Self.occurrence(for: schedule, at: scheduledAt)
     if schedule.overlapPolicy == .skip && !state.executions.isEmpty {
       try? await emit(event: .occurrenceSkipped(occurrence))
@@ -286,11 +339,22 @@ extension WorkflowScheduler {
     return schedule.recurrence.recurrences(of: schedule.startedAt, in: lowerBound...).first { _ in true }
   }
 
-  static func occurrence(for schedule: ScheduledWorkflowRecord, at date: Date) -> ScheduledWorkflowOccurrence {
-    return ScheduledWorkflowOccurrence(
-      id: ScheduleOccurrenceID(scheduleID: schedule.id, scheduledAt: date), scheduleID: schedule.id,
-      workflowType: schedule.workflowType, inputData: schedule.inputData,
-      retryPolicy: schedule.retryPolicy, scheduledAt: date
+  static func occurrence(
+    for schedule: ScheduledWorkflowRecord,
+    at date: Date,
+    triggerID: UUID? = nil
+  ) -> ScheduledWorkflowOccurrence {
+    ScheduledWorkflowOccurrence(
+      id: ScheduleOccurrenceID(
+        scheduleID: schedule.id,
+        scheduledAt: date,
+        triggerID: triggerID
+      ),
+      scheduleID: schedule.id,
+      workflowType: schedule.workflowType,
+      inputData: schedule.inputData,
+      retryPolicy: schedule.retryPolicy,
+      scheduledAt: date
     )
   }
 
@@ -298,12 +362,19 @@ extension WorkflowScheduler {
     var state = state
     switch event {
     case .scheduled(let schedule): state.schedule = schedule
-    case .cancelled: state.schedule = nil; state.executions = state.executions.filter { if case .running = $0.value { return true }; return false }
+    case .cancelled:
+      state.schedule = nil
+      state.executions = state.executions.filter {
+        if case .running = $0.value { return true }
+        return false
+      }
     case .occurrenceClaimed(let occurrence):
       state.schedule?.lastFiredAt = occurrence.scheduledAt
       state.executions[occurrence.id] = .pending(occurrence)
     case .occurrenceSkipped(let occurrence):
       state.schedule?.lastFiredAt = occurrence.scheduledAt
+    case .occurrenceTriggered(let occurrence):
+      state.executions[occurrence.id] = .pending(occurrence)
     case .occurrenceStarted(let occurrence):
       state.executions[occurrence.id] = .running(occurrence)
     case .occurrenceFinished(let id):

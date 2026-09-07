@@ -20,8 +20,11 @@ struct SchedulerTests {
     let date = Date(timeIntervalSince1970: 1_700_000_000)
     let occurrence = ScheduledWorkflowOccurrence(
       id: .init(scheduleID: "daily-report", scheduledAt: date),
-      scheduleID: "daily-report", workflowType: TimerWorkflow.name,
-      inputData: Data(), retryPolicy: nil, scheduledAt: date
+      scheduleID: "daily-report",
+      workflowType: TimerWorkflow.name,
+      inputData: Data(),
+      retryPolicy: nil,
+      scheduledAt: date
     )
     var state = WorkflowScheduler<TimerWorkflow>.State()
     state = WorkflowScheduler<TimerWorkflow>.reduce(state: state, event: .occurrenceClaimed(occurrence))
@@ -39,14 +42,56 @@ struct SchedulerTests {
   }
 
   @Test
+  func manualOccurrenceDoesNotAdvanceTheRecurringSchedule() {
+    let scheduledAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let manualAt = scheduledAt.addingTimeInterval(12)
+    let recurrence = Calendar.RecurrenceRule.daily(
+      calendar: Calendar(identifier: .gregorian),
+      hours: [8],
+      minutes: [30]
+    )
+    let record = ScheduledWorkflowRecord(
+      id: "daily-report",
+      recurrence: recurrence,
+      startedAt: scheduledAt,
+      workflowType: TimerWorkflow.name,
+      inputData: Data(),
+      retryPolicy: nil,
+      lastFiredAt: nil
+    )
+    let manual = WorkflowScheduler<TimerWorkflow>.occurrence(
+      for: record,
+      at: manualAt,
+      triggerID: UUID()
+    )
+
+    var state = WorkflowScheduler<TimerWorkflow>.reduce(
+      state: .init(),
+      event: .scheduled(record)
+    )
+    state = WorkflowScheduler<TimerWorkflow>.reduce(
+      state: state,
+      event: .occurrenceTriggered(manual)
+    )
+
+    #expect(state.schedule?.lastFiredAt == nil)
+    #expect(state.executions[manual.id] != nil)
+    #expect(manual.workflowID.rawValue.contains("trigger-"))
+  }
+
+  @Test
   func recurrenceComputesNextCalendarFire() throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
     let recurrence = Calendar.RecurrenceRule.daily(calendar: calendar, hours: [8], minutes: [30])
     let start = Date(timeIntervalSince1970: 1_700_000_000)
     let record = ScheduledWorkflowRecord(
-      id: "daily-report", recurrence: recurrence, startedAt: start,
-      workflowType: TimerWorkflow.name, inputData: Data(), retryPolicy: nil,
+      id: "daily-report",
+      recurrence: recurrence,
+      startedAt: start,
+      workflowType: TimerWorkflow.name,
+      inputData: Data(),
+      retryPolicy: nil,
       lastFiredAt: nil
     )
     let next = WorkflowScheduler<TimerWorkflow>.nextFireDate(for: record)
@@ -67,12 +112,16 @@ struct SchedulerTests {
     let recurrence = Calendar.RecurrenceRule.daily(calendar: calendar, hours: [8], minutes: [30])
 
     try await system.workflows.schedule(
-      id: "daily-report", recurrence: recurrence,
-      workflow: TimerWorkflow.self, input: .init(delayMillis: 1)
+      id: "daily-report",
+      recurrence: recurrence,
+      workflow: TimerWorkflow.self,
+      input: .init(delayMillis: 1)
     )
     try await system.workflows.schedule(
-      id: "daily-report", recurrence: recurrence,
-      workflow: TimerWorkflow.self, input: .init(delayMillis: 2)
+      id: "daily-report",
+      recurrence: recurrence,
+      workflow: TimerWorkflow.self,
+      input: .init(delayMillis: 2)
     )
     let description = try await system.workflows.describeSchedule(id: "daily-report", workflow: TimerWorkflow.self)
     #expect(description?.id == "daily-report")
