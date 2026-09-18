@@ -103,6 +103,7 @@ public struct ScheduleDescription: Codable, Sendable {
   public let lastFiredAt: Date?
   public let nextFireAt: Date?
   public let nextFireIn: Duration?
+  public let paused: Bool
   public let executions: [ScheduleExecutionState]
 }
 
@@ -140,6 +141,8 @@ public enum ScheduleExecution: Codable, Sendable {
 public enum WorkflowSchedulerEvent: Codable, Sendable {
   case scheduled(ScheduledWorkflowRecord)
   case cancelled
+  case paused(reason: String?)
+  case unpaused(reason: String?)
   case occurrenceClaimed(ScheduledWorkflowOccurrence)
   case occurrenceSkipped(ScheduledWorkflowOccurrence)
   case occurrenceTriggered(ScheduledWorkflowOccurrence)
@@ -162,6 +165,7 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
 
   public struct State: Codable, Sendable {
     public var schedule: ScheduledWorkflowRecord?
+    public var paused: Bool = false
     public var executions: [ScheduleOccurrenceID: ScheduleExecution] = [:]
   }
 
@@ -234,6 +238,22 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
     timerTask = nil
   }
 
+  /// Stops automatic future occurrences while keeping the schedule durable.
+  /// Existing occurrence executions are allowed to finish.
+  distributed public func pause(reason: String? = nil) async throws {
+    guard state.schedule != nil, !state.paused else { return }
+    try await emit(event: .paused(reason: reason))
+    timerTask?.cancel()
+    timerTask = nil
+  }
+
+  /// Resumes automatic occurrences from the existing recurrence cursor.
+  distributed public func unpause(reason: String? = nil) async throws {
+    guard state.schedule != nil, state.paused else { return }
+    try await emit(event: .unpaused(reason: reason))
+    rearm()
+  }
+
   /// Runs one occurrence immediately without advancing the recurring
   /// schedule. The next calendar occurrence remains the next calendar
   /// occurrence after this call.
@@ -270,6 +290,7 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
       lastFiredAt: schedule.lastFiredAt,
       nextFireAt: Self.nextFireDate(for: schedule),
       nextFireIn: Self.nextFireDate(for: schedule).map { .milliseconds(Int64(max(0, $0.timeIntervalSinceNow * 1_000))) },
+      paused: state.paused,
       executions: state.executions.values.map(ScheduleExecutionState.init)
     )
   }
@@ -281,6 +302,7 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
   private func rearm() {
     timerTask?.cancel()
     timerTask = nil
+    guard !state.paused else { return }
     guard let schedule = state.schedule, let deadline = Self.nextFireDate(for: schedule) else { return }
     timerTask = Task {
       do {
@@ -364,10 +386,15 @@ extension WorkflowScheduler {
     case .scheduled(let schedule): state.schedule = schedule
     case .cancelled:
       state.schedule = nil
+      state.paused = false
       state.executions = state.executions.filter {
         if case .running = $0.value { return true }
         return false
       }
+    case .paused:
+      state.paused = true
+    case .unpaused:
+      state.paused = false
     case .occurrenceClaimed(let occurrence):
       state.schedule?.lastFiredAt = occurrence.scheduledAt
       state.executions[occurrence.id] = .pending(occurrence)

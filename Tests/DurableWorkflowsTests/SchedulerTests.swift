@@ -42,6 +42,40 @@ struct SchedulerTests {
   }
 
   @Test
+  func reducerPersistsPauseWithoutRemovingSchedule() {
+    let record = ScheduledWorkflowRecord(
+      id: "daily-report",
+      recurrence: .daily(
+        calendar: Calendar(identifier: .gregorian),
+        hours: [8],
+        minutes: [30]
+      ),
+      startedAt: Date(timeIntervalSince1970: 1_700_000_000),
+      workflowType: TimerWorkflow.name,
+      inputData: Data(),
+      retryPolicy: nil,
+      lastFiredAt: nil
+    )
+    var state = WorkflowScheduler<TimerWorkflow>.reduce(
+      state: .init(),
+      event: .scheduled(record)
+    )
+    state = WorkflowScheduler<TimerWorkflow>.reduce(
+      state: state,
+      event: .paused(reason: "maintenance")
+    )
+    #expect(state.schedule?.id == "daily-report")
+    #expect(state.paused)
+
+    state = WorkflowScheduler<TimerWorkflow>.reduce(
+      state: state,
+      event: .unpaused(reason: "finished")
+    )
+    #expect(state.schedule?.id == "daily-report")
+    #expect(!state.paused)
+  }
+
+  @Test
   func manualOccurrenceDoesNotAdvanceTheRecurringSchedule() {
     let scheduledAt = Date(timeIntervalSince1970: 1_700_000_000)
     let manualAt = scheduledAt.addingTimeInterval(12)
@@ -131,6 +165,22 @@ struct SchedulerTests {
     #expect(description?.nextFireAt != nil)
     #expect(description?.nextFireIn != nil)
     #expect(description?.executions.isEmpty == true)
+
+    try await system.workflows.pauseSchedule(
+      id: "daily-report",
+      workflow: TimerWorkflow.self,
+      reason: "maintenance"
+    )
+    let paused = try await system.workflows.describeSchedule(id: "daily-report", workflow: TimerWorkflow.self)
+    #expect(paused?.paused == true)
+
+    try await system.workflows.unpauseSchedule(
+      id: "daily-report",
+      workflow: TimerWorkflow.self,
+      reason: "finished"
+    )
+    let resumed = try await system.workflows.describeSchedule(id: "daily-report", workflow: TimerWorkflow.self)
+    #expect(resumed?.paused == false)
 
     try await system.workflows.cancelSchedule(id: "daily-report", workflow: TimerWorkflow.self)
     #expect(try await system.workflows.describeSchedule(id: "daily-report", workflow: TimerWorkflow.self) == nil)

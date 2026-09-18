@@ -800,7 +800,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
             id: self.workflowID,
             typeName: WorkflowType.name
           )
-          try? await self.actorSystem.virtualActors.deactivate(self)
+          _ = try? await self.actorSystem.virtualActors.deactivate(self)
         }
       case .idle, .running:
         break

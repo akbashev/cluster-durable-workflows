@@ -85,6 +85,26 @@ public actor DurableWorkflowsPlugin: Plugin {
     )
   }
 
+  /// Pauses future occurrences while keeping the durable schedule registered.
+  public func pauseSchedule<WorkflowType: WorkflowProtocol>(
+    id: ScheduleID,
+    workflow: WorkflowType.Type,
+    reason: String? = nil
+  ) async throws {
+    let scheduler = try await self.scheduler(for: WorkflowType.self, id: id)
+    try await scheduler.pause(reason: reason)
+  }
+
+  /// Resumes future occurrences for a paused durable schedule.
+  public func unpauseSchedule<WorkflowType: WorkflowProtocol>(
+    id: ScheduleID,
+    workflow: WorkflowType.Type,
+    reason: String? = nil
+  ) async throws {
+    let scheduler = try await self.scheduler(for: WorkflowType.self, id: id)
+    try await scheduler.unpause(reason: reason)
+  }
+
   public func describeSchedule<WorkflowType: WorkflowProtocol>(
     id: ScheduleID,
     workflow: WorkflowType.Type
