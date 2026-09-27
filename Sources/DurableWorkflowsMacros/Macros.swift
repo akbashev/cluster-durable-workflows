@@ -95,6 +95,9 @@ public struct ActivityContainerMacro: MemberMacro, ExtensionMacro {
   ) throws -> [DeclSyntax] {
     var activityCases: [String] = []
     var activityWrappers: [String] = []
+    let declaresInitializer = declaration.memberBlock.members.contains { member in
+      member.decl.is(InitializerDeclSyntax.self)
+    }
 
     for member in declaration.memberBlock.members {
       guard let funcDecl = member.decl.as(FunctionDeclSyntax.self) else { continue }
@@ -166,7 +169,13 @@ public struct ActivityContainerMacro: MemberMacro, ExtensionMacro {
       }
       """
 
-    return [handleFunc, activitiesEnum]
+    var members: [DeclSyntax] = []
+    if !declaresInitializer {
+      members.append("public init() {}")
+    }
+    members.append(handleFunc)
+    members.append(activitiesEnum)
+    return members
   }
 }
 

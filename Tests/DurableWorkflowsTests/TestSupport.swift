@@ -80,9 +80,15 @@ public struct TimerWorkflow {
 
 @ActivityContainer
 public struct TimerActivities {
+  private let greeting: String
+
+  public init(greeting: String) {
+    self.greeting = greeting
+  }
+
   @Activity
   public func greet(input: String, context: ActivityContext) async throws -> String {
-    "hello \(input)"
+    "\(self.greeting) \(input)"
   }
 }
 
@@ -284,7 +290,7 @@ func makeWorkflowSystem(
   let node = await VirtualNode(actorSystem: system)
   let worker = await DurableActivityDispatchWorker<TimerWorkflow>(
     actorSystem: system,
-    activities: TimerActivities()
+    activities: TimerActivities(greeting: "hello")
   )
   system.cluster.join(endpoint: system.cluster.endpoint)
   try await system.cluster.joined(within: .seconds(5))
