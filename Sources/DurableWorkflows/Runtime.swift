@@ -81,9 +81,12 @@ public distributed actor DurableActivityDispatchWorker<WorkflowType: WorkflowPro
   private let container: WorkflowType.Activities
   private var recoverTask: Task<Void, Never>?
 
-  public init(actorSystem: ClusterSystem) async {
+  public init(
+    actorSystem: ClusterSystem,
+    activities: WorkflowType.Activities
+  ) async {
     self.actorSystem = actorSystem
-    self.container = WorkflowType.Activities()
+    self.container = activities
     await self.actorSystem.receptionist.checkIn(self, with: .durableWorkers(for: WorkflowType.self))
     self.checkRecover()
   }

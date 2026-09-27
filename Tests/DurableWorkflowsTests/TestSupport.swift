@@ -231,7 +231,10 @@ func makeCompensatingWorkflowSystem(
     $0.plugins.install(plugin: DurableWorkflowsPlugin())
   }
   let node = await VirtualNode(actorSystem: system)
-  let worker = await DurableActivityDispatchWorker<CompensatingWorkflow>(actorSystem: system)
+  let worker = await DurableActivityDispatchWorker<CompensatingWorkflow>(
+    actorSystem: system,
+    activities: CompensatingActivities()
+  )
   system.cluster.join(endpoint: system.cluster.endpoint)
   try await system.cluster.joined(within: .seconds(5))
   return (system, node, worker)
@@ -252,7 +255,10 @@ func makeFlakyWorkflowSystem(
     $0.plugins.install(plugin: DurableWorkflowsPlugin())
   }
   let node = await VirtualNode(actorSystem: system)
-  let worker = await DurableActivityDispatchWorker<FlakyWorkflow>(actorSystem: system)
+  let worker = await DurableActivityDispatchWorker<FlakyWorkflow>(
+    actorSystem: system,
+    activities: FlakyActivities()
+  )
   system.cluster.join(endpoint: system.cluster.endpoint)
   try await system.cluster.joined(within: .seconds(5))
   return (system, node, worker)
@@ -276,7 +282,10 @@ func makeWorkflowSystem(
     $0.plugins.install(plugin: DurableWorkflowsPlugin())
   }
   let node = await VirtualNode(actorSystem: system)
-  let worker = await DurableActivityDispatchWorker<TimerWorkflow>(actorSystem: system)
+  let worker = await DurableActivityDispatchWorker<TimerWorkflow>(
+    actorSystem: system,
+    activities: TimerActivities()
+  )
   system.cluster.join(endpoint: system.cluster.endpoint)
   try await system.cluster.joined(within: .seconds(5))
   return (system, node, worker)

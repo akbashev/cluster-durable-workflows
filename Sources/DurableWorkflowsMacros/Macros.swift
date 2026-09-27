@@ -143,8 +143,6 @@ public struct ActivityContainerMacro: MemberMacro, ExtensionMacro {
       }
     }
 
-    let initDecl: DeclSyntax = "public init() {}"
-
     let handleFunc: DeclSyntax =
       """
       public func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data {
@@ -168,7 +166,7 @@ public struct ActivityContainerMacro: MemberMacro, ExtensionMacro {
       }
       """
 
-    return [initDecl, handleFunc, activitiesEnum]
+    return [handleFunc, activitiesEnum]
   }
 }
 

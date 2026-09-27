@@ -156,6 +156,5 @@ public protocol ActivityReference {
 }
 
 public protocol ActivityContainerProtocol: Sendable {
-  init()
   func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data
 }
