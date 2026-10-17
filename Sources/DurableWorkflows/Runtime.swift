@@ -493,7 +493,10 @@ struct RetryState: Codable, Sendable {
 
 @EventSourced
 @VirtualActor
-public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
+/// `Input` and `Output` are `WorkflowType`'s, as the actor's own generic parameters: a distributed method
+/// can't use an associated type such as `WorkflowType.Input` (swiftlang/swift#74769).
+public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol, Input, Output>
+where WorkflowType.Input == Input, WorkflowType.Output == Output {
   public typealias ActorSystem = ClusterSystem
   public typealias Event = WorkflowEvent
 
@@ -590,7 +593,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   }
 
   @discardableResult
-  distributed public func resume() async throws -> WorkflowResult<WorkflowType.Output> {
+  distributed public func resume() async throws -> WorkflowResult<Output> {
     switch self.state.status {
     case .running:
       if let task = self.currentExecutionTask { return try await task.value }
@@ -618,9 +621,9 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
 
   @discardableResult
   distributed public func execute(
-    input: WorkflowType.Input,
+    input: Input,
     retryPolicy: RetryPolicy? = nil
-  ) async throws -> WorkflowResult<WorkflowType.Output> {
+  ) async throws -> WorkflowResult<Output> {
     let inputData = try self.encoder.encode(input)
     switch self.state.status {
     case .completed(let outputData):
@@ -666,7 +669,7 @@ public distributed actor WorkflowActor<WorkflowType: WorkflowProtocol> {
   /// result should join with `execute`, while scheduling tools need an
   /// acceptance boundary and must not wait until a future timer fires.
   distributed public func start(
-    input: WorkflowType.Input,
+    input: Input,
     retryPolicy: RetryPolicy? = nil
   ) async throws -> WorkflowStartOutcome {
     let inputData = try self.encoder.encode(input)

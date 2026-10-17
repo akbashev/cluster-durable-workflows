@@ -26,18 +26,18 @@ struct SchedulerTests {
       retryPolicy: nil,
       scheduledAt: date
     )
-    var state = WorkflowScheduler<TimerWorkflow>.State()
-    state = WorkflowScheduler<TimerWorkflow>.reduce(state: state, event: .occurrenceClaimed(occurrence))
+    var state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.State()
+    state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(state: state, event: .occurrenceClaimed(occurrence))
     guard case .pending = state.executions[occurrence.id] else {
       Issue.record("expected pending occurrence")
       return
     }
-    state = WorkflowScheduler<TimerWorkflow>.reduce(state: state, event: .occurrenceStarted(occurrence))
+    state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(state: state, event: .occurrenceStarted(occurrence))
     guard case .running = state.executions[occurrence.id] else {
       Issue.record("expected running occurrence")
       return
     }
-    state = WorkflowScheduler<TimerWorkflow>.reduce(state: state, event: .occurrenceFinished(id: occurrence.id))
+    state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(state: state, event: .occurrenceFinished(id: occurrence.id))
     #expect(state.executions[occurrence.id] == nil)
   }
 
@@ -56,18 +56,18 @@ struct SchedulerTests {
       retryPolicy: nil,
       lastFiredAt: nil
     )
-    var state = WorkflowScheduler<TimerWorkflow>.reduce(
+    var state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(
       state: .init(),
       event: .scheduled(record)
     )
-    state = WorkflowScheduler<TimerWorkflow>.reduce(
+    state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(
       state: state,
       event: .paused(reason: "maintenance")
     )
     #expect(state.schedule?.id == "daily-report")
     #expect(state.paused)
 
-    state = WorkflowScheduler<TimerWorkflow>.reduce(
+    state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(
       state: state,
       event: .unpaused(reason: "finished")
     )
@@ -93,17 +93,17 @@ struct SchedulerTests {
       retryPolicy: nil,
       lastFiredAt: nil
     )
-    let manual = WorkflowScheduler<TimerWorkflow>.occurrence(
+    let manual = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.occurrence(
       for: record,
       at: manualAt,
       triggerID: UUID()
     )
 
-    var state = WorkflowScheduler<TimerWorkflow>.reduce(
+    var state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(
       state: .init(),
       event: .scheduled(record)
     )
-    state = WorkflowScheduler<TimerWorkflow>.reduce(
+    state = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.reduce(
       state: state,
       event: .occurrenceTriggered(manual)
     )
@@ -128,7 +128,7 @@ struct SchedulerTests {
       retryPolicy: nil,
       lastFiredAt: nil
     )
-    let next = WorkflowScheduler<TimerWorkflow>.nextFireDate(for: record)
+    let next = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.nextFireDate(for: record)
     #expect(next != nil)
     #expect(calendar.component(.hour, from: next!) == 8)
     #expect(calendar.component(.minute, from: next!) == 30)

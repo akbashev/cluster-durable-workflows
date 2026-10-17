@@ -154,7 +154,10 @@ public enum WorkflowSchedulerEvent: Codable, Sendable {
 /// are independently placed, passivated, and reactivated across the cluster.
 @EventSourced
 @VirtualActor
-public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
+/// `Input` is `WorkflowType.Input`, as the actor's own generic parameter: a distributed method can't use an
+/// associated type (swiftlang/swift#74769).
+public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol, Input>
+where WorkflowType.Input == Input {
   public typealias ActorSystem = ClusterSystem
   public typealias Event = WorkflowSchedulerEvent
 
@@ -205,7 +208,7 @@ public distributed actor WorkflowScheduler<WorkflowType: WorkflowProtocol> {
 
   distributed public func schedule(
     recurrence: Calendar.RecurrenceRule,
-    input: WorkflowType.Input,
+    input: Input,
     retryPolicy: RetryPolicy?,
     overlapPolicy: ScheduleOverlapPolicy = .allow
   ) async throws {

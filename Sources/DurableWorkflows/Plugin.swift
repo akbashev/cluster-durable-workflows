@@ -207,7 +207,7 @@ public actor DurableWorkflowsPlugin: Plugin {
     }
   }
 
-  private func scheduler<WorkflowType: WorkflowProtocol>(for type: WorkflowType.Type, id: ScheduleID) async throws -> WorkflowScheduler<WorkflowType> {
+  private func scheduler<WorkflowType: WorkflowProtocol>(for type: WorkflowType.Type, id: ScheduleID) async throws -> WorkflowScheduler<WorkflowType, WorkflowType.Input> {
     try await self.actorSystem.virtualActors.getActor(
       identifiedBy: .init(
         rawValue: SchedulePersistenceID(
@@ -215,7 +215,7 @@ public actor DurableWorkflowsPlugin: Plugin {
           scheduleID: id
         ).rawValue
       ),
-      dependency: WorkflowScheduler<WorkflowType>.Dependency(
+      dependency: WorkflowScheduler<WorkflowType, WorkflowType.Input>.Dependency(
         scheduleID: id
       )
     )
@@ -328,12 +328,12 @@ public actor DurableWorkflowsPlugin: Plugin {
   private func getActor<WorkflowType: WorkflowProtocol>(
     _ type: WorkflowType.Type,
     options: WorkflowOptions
-  ) async throws -> WorkflowActor<WorkflowType> {
+  ) async throws -> WorkflowActor<WorkflowType, WorkflowType.Input, WorkflowType.Output> {
     try await self.actorSystem.virtualActors.getActor(
       identifiedBy: .init(
         rawValue: WorkflowPersistenceID(workflowType: WorkflowType.name, id: options.id).rawValue
       ),
-      dependency: WorkflowActor<WorkflowType>.Dependency(
+      dependency: WorkflowActor<WorkflowType, WorkflowType.Input, WorkflowType.Output>.Dependency(
         workflowID: options.id
       )
     )
