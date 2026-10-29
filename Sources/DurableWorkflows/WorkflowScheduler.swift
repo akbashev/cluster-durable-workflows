@@ -359,8 +359,10 @@ where WorkflowType.Input == Input {
 }
 
 extension WorkflowScheduler {
+  /// The next occurrence: strictly after the last one, and the first strictly after the schedule
+  /// was made, so a schedule is never due at once.
   static func nextFireDate(for schedule: ScheduledWorkflowRecord) -> Date? {
-    let lowerBound = schedule.lastFiredAt?.addingTimeInterval(0.001) ?? schedule.startedAt
+    let lowerBound = (schedule.lastFiredAt ?? schedule.startedAt).addingTimeInterval(0.001)
     return schedule.recurrence.recurrences(of: schedule.startedAt, in: lowerBound...).first { _ in true }
   }
 
