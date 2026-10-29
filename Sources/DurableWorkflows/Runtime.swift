@@ -696,14 +696,34 @@ where WorkflowType.Input == Input, WorkflowType.Output == Output {
       }
     }
 
+    // Accept the run only once its start is journaled, so a crash after
+    // `.started` still resumes it. Its task holds the run's place meanwhile:
+    // a concurrent `start` or `execute` joins it rather than starting another.
+    let journaled = Task {
+      try await self.journalStart(inputData: inputData, retryPolicy: retryPolicy)
+    }
     let task = Task {
-      try await self._run(
-        input: input,
-        start: .fresh(inputData: inputData, retryPolicy: retryPolicy)
-      )
+      try await journaled.value
+      // A `cancel()` once the start was journaled ends the run before it runs.
+      guard case .running = self.state.status else { throw CancellationError() }
+      return try await self._run(input: input)
     }
     self.currentExecutionTask = task
+    do {
+      try await journaled.value
+    } catch {
+      if self.currentExecutionTask == task { self.currentExecutionTask = nil }
+      throw error
+    }
     return .started
+  }
+
+  /// Journals a fresh run's boundary, and the retry policy it runs under.
+  private func journalStart(inputData: Data, retryPolicy: RetryPolicy?) async throws {
+    try await self.emit(event: .executionStarted(inputData: inputData))
+    if let retryPolicy {
+      try await self.emit(event: .retryPolicyConfigured(retryPolicy))
+    }
   }
 
   private func _run(
@@ -719,10 +739,7 @@ where WorkflowType.Input == Input, WorkflowType.Output == Output {
         // Journal the run boundary (and the retry policy) BEFORE the body
         // runs, so a crash between start and the first activity still
         // resumes correctly.
-        try await self.emit(event: .executionStarted(inputData: inputData))
-        if let retryPolicy {
-          try await self.emit(event: .retryPolicyConfigured(retryPolicy))
-        }
+        try await self.journalStart(inputData: inputData, retryPolicy: retryPolicy)
       case .resume:
         // Retry backoff: the next attempt was scheduled at a journaled
         // absolute deadline. Wait out only the remainder (crash-resume into a

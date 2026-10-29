@@ -194,4 +194,74 @@ struct TimerWorkflowTests {
     _ = node
     _ = worker
   }
+
+  /// `start` accepts a run only once its start is journaled: right after it
+  /// returns, the workflow reads as running with its input and retry policy,
+  /// and a crash from then on resumes it.
+  @Test
+  func startReturnsOnceTheRunIsJournaled() async throws {
+    let (system, node, worker) = try await makeWorkflowSystem(
+      name: "timers-start-journaled",
+      port: 4612,
+      store: InMemoryEventStore()
+    )
+    let options = WorkflowOptions(
+      id: "wf-start-journaled",
+      retryPolicy: RetryPolicy(initialInterval: .milliseconds(100), maximumAttempts: 2)
+    )
+
+    try await system.workflows.start(
+      type: TimerWorkflow.self,
+      options: options,
+      input: .init(delayMillis: 60_000)
+    )
+
+    let info = try await system.workflows.getStatus(type: TimerWorkflow.self, options: options)
+    guard case .running = info.status else {
+      Issue.record("expected running, got \(info.status)")
+      return
+    }
+    #expect(info.events.contains { if case .executionStarted = $0 { true } else { false } })
+    #expect(info.events.contains { if case .retryPolicyConfigured = $0 { true } else { false } })
+
+    try await system.workflows.cancel(type: TimerWorkflow.self, options: options)
+    _ = node
+    _ = worker
+  }
+
+  /// A second `start` of the same id while the first's start is still being
+  /// journaled joins it: one run, one `executionStarted`.
+  @Test
+  func concurrentStartStartsOnlyOneRun() async throws {
+    let gate = GatedEventStore(inner: InMemoryEventStore())
+    let (system, node, worker) = try await makeWorkflowSystem(
+      name: "timers-start-race",
+      port: 4613,
+      store: gate
+    )
+    let options = WorkflowOptions(id: "wf-start-race")
+
+    async let first: Void = system.workflows.start(
+      type: TimerWorkflow.self,
+      options: options,
+      input: .init(delayMillis: 60_000)
+    )
+    try await Task.sleep(for: .milliseconds(100))
+    async let second: Void = system.workflows.start(
+      type: TimerWorkflow.self,
+      options: options,
+      input: .init(delayMillis: 60_000)
+    )
+    try await Task.sleep(for: .milliseconds(100))
+    gate.open()
+    _ = try await (first, second)
+
+    let info = try await system.workflows.getStatus(type: TimerWorkflow.self, options: options)
+    let starts = info.events.filter { if case .executionStarted = $0 { true } else { false } }
+    #expect(starts.count == 1)
+
+    try await system.workflows.cancel(type: TimerWorkflow.self, options: options)
+    _ = node
+    _ = worker
+  }
 }
