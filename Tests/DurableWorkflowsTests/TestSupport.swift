@@ -276,7 +276,7 @@ func makeFlakyWorkflowSystem(
 func makeWorkflowSystem(
   name: String,
   port: Int,
-  store: InMemoryEventStore
+  store: some EventStore
 ) async throws -> (ClusterSystem, VirtualNode, DurableActivityDispatchWorker<TimerWorkflow>) {
   let system = await ClusterSystem(name) {
     $0.bindPort = port
