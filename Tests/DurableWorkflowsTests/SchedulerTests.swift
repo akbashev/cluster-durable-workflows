@@ -113,6 +113,24 @@ struct SchedulerTests {
     #expect(manual.workflowID.rawValue.contains("trigger-"))
   }
 
+  /// A schedule is first due after it's made, never at once: every five minutes from now is due
+  /// in five minutes.
+  @Test
+  func aScheduleIsFirstDueAfterItIsMade() throws {
+    let start = Date(timeIntervalSince1970: 1_700_000_000)
+    let record = ScheduledWorkflowRecord(
+      id: "every-five-minutes",
+      recurrence: Calendar.RecurrenceRule(calendar: Calendar(identifier: .gregorian), frequency: .minutely, interval: 5),
+      startedAt: start,
+      workflowType: TimerWorkflow.name,
+      inputData: Data(),
+      retryPolicy: nil,
+      lastFiredAt: nil
+    )
+    let next = WorkflowScheduler<TimerWorkflow, TimerWorkflow.Input>.nextFireDate(for: record)
+    #expect(next == start.addingTimeInterval(300))
+  }
+
   @Test
   func recurrenceComputesNextCalendarFire() throws {
     var calendar = Calendar(identifier: .gregorian)
