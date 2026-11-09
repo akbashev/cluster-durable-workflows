@@ -161,6 +161,10 @@ where WorkflowType.Input == Input {
   public typealias ActorSystem = ClusterSystem
   public typealias Event = WorkflowSchedulerEvent
 
+  /// Every event of every schedule of `WorkflowType` is kept with its tag, so a read side can
+  /// follow them all (see `EventTag.schedules(of:)`).
+  public let tagging: Tagging<WorkflowSchedulerEvent> = .always(.schedules(of: WorkflowType.self))
+
   public struct Dependency: Codable, Sendable {
     public let scheduleID: ScheduleID
     public init(scheduleID: ScheduleID) { self.scheduleID = scheduleID }

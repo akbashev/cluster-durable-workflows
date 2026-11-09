@@ -1,5 +1,6 @@
 import Distributed
 import DistributedCluster
+import EventSourcing
 import Foundation
 import VirtualActors
 
@@ -157,4 +158,18 @@ public protocol ActivityReference {
 
 public protocol ActivityContainerProtocol: Sendable {
   func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data
+}
+
+extension EventTag {
+  /// The tag the events of every run of `type` are kept with: `WorkflowEvent`s, which a read side
+  /// follows by it.
+  public static func workflows<WorkflowType: WorkflowProtocol>(of type: WorkflowType.Type) -> EventTag {
+    EventTag("workflows:\(WorkflowType.name)")
+  }
+
+  /// The tag the events of every schedule of `type` are kept with: `WorkflowSchedulerEvent`s,
+  /// which a read side follows by it.
+  public static func schedules<WorkflowType: WorkflowProtocol>(of type: WorkflowType.Type) -> EventTag {
+    EventTag("schedules:\(WorkflowType.name)")
+  }
 }
