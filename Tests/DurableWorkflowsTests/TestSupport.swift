@@ -5,45 +5,72 @@ import Foundation
 import Synchronization
 import VirtualActors
 
-/// Journal store for tests: keeps events in memory and rejects every repeated
-/// `(id, sequenceNumber)` write as `EventStore` requires.
+/// Journal store for tests: keeps events in memory, each with its tags at the next offset, and
+/// rejects every repeated `(id, sequenceNumber)` write as `EventStore` requires.
 final class InMemoryEventStore: EventStore, Sendable {
   struct Conflict: Error {}
 
-  private let storage = Mutex<[String: [(sequenceNumber: Int64, data: Data)]]>([:])
+  /// An event as kept: its offset is its place in the journal, counting from 1.
+  private struct Kept {
+    let id: String
+    let sequenceNumber: Int64
+    let tags: Set<EventTag>
+    let data: Data
+  }
+
+  private let journal = Mutex<[Kept]>([])
 
   func persistEvent<Event: Codable & Sendable>(
     _ event: Event,
     id: String,
-    sequenceNumber: Int64
+    sequenceNumber: Int64,
+    tags: Set<EventTag>
   ) async throws {
     let data = try JSONEncoder().encode(event)
-    try self.storage.withLock { store in
-      var log = store[id] ?? []
-      if log.contains(where: { $0.sequenceNumber == sequenceNumber }) {
+    try self.journal.withLock { journal in
+      if journal.contains(where: { $0.id == id && $0.sequenceNumber == sequenceNumber }) {
         throw Conflict()
       }
-      log.append((sequenceNumber, data))
-      log.sort { $0.sequenceNumber < $1.sequenceNumber }
-      store[id] = log
+      journal.append(Kept(id: id, sequenceNumber: sequenceNumber, tags: tags, data: data))
     }
+  }
+
+  /// `event` kept untagged, as a test lays down a journal before a workflow reads it.
+  func persistEvent<Event: Codable & Sendable>(_ event: Event, id: String, sequenceNumber: Int64) async throws {
+    try await self.persistEvent(event, id: id, sequenceNumber: sequenceNumber, tags: [])
   }
 
   func eventStream<Event: Codable & Sendable>(
     id: String,
     fromSequenceNumber: Int64
   ) async throws -> EventStream<Event> {
-    let log = self.storage.withLock { $0[id] ?? [] }
-    let envelopes =
-      try log
-      .filter { $0.sequenceNumber >= fromSequenceNumber }
-      .map {
-        EventEnvelope(
-          persistenceID: id,
-          sequenceNumber: $0.sequenceNumber,
-          event: try JSONDecoder().decode(Event.self, from: $0.data)
-        )
-      }
+    try self.envelopes { kept, _ in kept.id == id && kept.sequenceNumber >= fromSequenceNumber }
+  }
+
+  func currentEventsByTag<Event: Codable & Sendable>(
+    _ tag: EventTag,
+    after offset: Offset
+  ) async throws -> EventStream<Event> {
+    try self.envelopes { kept, keptAt in kept.tags.contains(tag) && keptAt > offset }
+  }
+
+  /// The events kept so far that `included` takes, in sequence order for each entity, each
+  /// decoded as `Event`.
+  private func envelopes<Event: Codable & Sendable>(
+    _ included: (Kept, Offset) -> Bool
+  ) throws -> EventStream<Event> {
+    let journal = self.journal.withLock { $0 }
+    let envelopes = try journal.enumerated().compactMap { index, kept -> EventEnvelope<Event>? in
+      let offset = Offset(Int64(index + 1))
+      guard included(kept, offset) else { return nil }
+      return EventEnvelope(
+        persistenceID: kept.id,
+        sequenceNumber: kept.sequenceNumber,
+        offset: offset,
+        event: try JSONDecoder().decode(Event.self, from: kept.data)
+      )
+    }
+    .sorted { ($0.persistenceID, $0.sequenceNumber) < ($1.persistenceID, $1.sequenceNumber) }
     return AsyncThrowingStream { continuation in
       for envelope in envelopes {
         continuation.yield(envelope)
@@ -232,7 +259,8 @@ func makeCompensatingWorkflowSystem(
     $0.bindPort = port
     $0.autoLeaderElection = .lowestReachable(minNumberOfMembers: 1)
     $0.plugins.install(plugin: ClusterSingletonPlugin())
-    $0.plugins.install(plugin: ClusterVirtualActorsPlugin(replicationFactor: 10))
+    let virtualActors = ClusterVirtualActorsPlugin.configuring(&$0, replicationFactor: 10)
+    $0.plugins.install(plugin: virtualActors)
     $0.plugins.install(plugin: ClusterJournalPlugin { _ in store })
     $0.plugins.install(plugin: DurableWorkflowsPlugin())
   }
@@ -256,7 +284,8 @@ func makeFlakyWorkflowSystem(
     $0.bindPort = port
     $0.autoLeaderElection = .lowestReachable(minNumberOfMembers: 1)
     $0.plugins.install(plugin: ClusterSingletonPlugin())
-    $0.plugins.install(plugin: ClusterVirtualActorsPlugin(replicationFactor: 10))
+    let virtualActors = ClusterVirtualActorsPlugin.configuring(&$0, replicationFactor: 10)
+    $0.plugins.install(plugin: virtualActors)
     $0.plugins.install(plugin: ClusterJournalPlugin { _ in store })
     $0.plugins.install(plugin: DurableWorkflowsPlugin())
   }
@@ -283,7 +312,8 @@ func makeWorkflowSystem(
     // For singleton plugin to work we need to choose a leader by having 1 member
     $0.autoLeaderElection = .lowestReachable(minNumberOfMembers: 1)
     $0.plugins.install(plugin: ClusterSingletonPlugin())
-    $0.plugins.install(plugin: ClusterVirtualActorsPlugin(replicationFactor: 10))
+    let virtualActors = ClusterVirtualActorsPlugin.configuring(&$0, replicationFactor: 10)
+    $0.plugins.install(plugin: virtualActors)
     $0.plugins.install(plugin: ClusterJournalPlugin { _ in store })
     $0.plugins.install(plugin: DurableWorkflowsPlugin())
   }
@@ -315,12 +345,13 @@ final class GatedEventStore: EventStore, Sendable {
   func persistEvent<Event: Codable & Sendable>(
     _ event: Event,
     id: String,
-    sequenceNumber: Int64
+    sequenceNumber: Int64,
+    tags: Set<EventTag>
   ) async throws {
     while self._closed.withLock({ $0 }) {
       try await Task.sleep(for: .milliseconds(10))
     }
-    try await self.inner.persistEvent(event, id: id, sequenceNumber: sequenceNumber)
+    try await self.inner.persistEvent(event, id: id, sequenceNumber: sequenceNumber, tags: tags)
   }
 
   func eventStream<Event: Codable & Sendable>(
@@ -328,6 +359,13 @@ final class GatedEventStore: EventStore, Sendable {
     fromSequenceNumber: Int64
   ) async throws -> EventStream<Event> {
     try await self.inner.eventStream(id: id, fromSequenceNumber: fromSequenceNumber)
+  }
+
+  func currentEventsByTag<Event: Codable & Sendable>(
+    _ tag: EventTag,
+    after offset: Offset
+  ) async throws -> EventStream<Event> {
+    try await self.inner.currentEventsByTag(tag, after: offset)
   }
 }
 
