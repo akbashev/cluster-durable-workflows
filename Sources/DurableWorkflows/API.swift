@@ -1,6 +1,5 @@
 import Distributed
 public import DistributedCluster
-public import EventSourcing
 public import Foundation
 import VirtualActors
 
@@ -160,18 +159,4 @@ public protocol ActivityContainerProtocol: Sendable {
   /// Runs the activity `invocation` names. An activity is independent work that belongs to no
   /// actor: it runs concurrently, never holding the worker that dispatched it.
   @concurrent func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data
-}
-
-extension EventTag {
-  /// The tag the events of every run of `type` are kept with: `WorkflowEvent`s, which a read side
-  /// follows by it.
-  public static func workflows<WorkflowType: WorkflowProtocol>(of type: WorkflowType.Type) -> EventTag {
-    EventTag("workflows:\(WorkflowType.name)")
-  }
-
-  /// The tag the events of every schedule of `type` are kept with: `WorkflowSchedulerEvent`s,
-  /// which a read side follows by it.
-  public static func schedules<WorkflowType: WorkflowProtocol>(of type: WorkflowType.Type) -> EventTag {
-    EventTag("schedules:\(WorkflowType.name)")
-  }
 }

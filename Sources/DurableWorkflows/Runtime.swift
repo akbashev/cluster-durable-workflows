@@ -500,10 +500,6 @@ where WorkflowType.Input == Input, WorkflowType.Output == Output {
   public typealias ActorSystem = ClusterSystem
   public typealias Event = WorkflowEvent
 
-  /// Every event of every run of `WorkflowType` is kept with its tag, so a read side can follow
-  /// them all (see `EventTag.workflows(of:)`).
-  public let tagging: Tagging<WorkflowEvent> = .always(.workflows(of: WorkflowType.self))
-
   public struct Dependency: Codable, Sendable {
     public let workflowID: WorkflowID
 
