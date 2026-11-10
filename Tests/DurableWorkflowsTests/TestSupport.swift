@@ -1,7 +1,7 @@
-import DistributedCluster
-import DurableWorkflows
+public import DistributedCluster
+public import DurableWorkflows
 import EventSourcing
-import Foundation
+public import Foundation
 import Synchronization
 import VirtualActors
 

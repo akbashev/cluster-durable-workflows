@@ -1,5 +1,5 @@
 import DistributedCluster
-import Foundation
+public import Foundation
 
 /// Pure run-level decisions, extracted from `WorkflowActor` so they can be
 /// tested without booting a cluster. The actor's job is only to journal and
@@ -20,7 +20,7 @@ enum RunFailureDecision: Equatable, Sendable {
 /// journaled deadline — not this recomputation — is the source of truth once
 /// emitted. Jitter is rolled here, once, live; replay never re-rolls.
 func decideOnRunFailure(
-  error: Error,
+  error: any Error,
   retry: RetryState?,
   now: Date
 ) -> RunFailureDecision {

@@ -1,6 +1,6 @@
 import Distributed
-import DistributedCluster
-import Foundation
+public import DistributedCluster
+public import Foundation
 import VirtualActors
 
 public struct WorkflowDescription: Codable, Sendable {

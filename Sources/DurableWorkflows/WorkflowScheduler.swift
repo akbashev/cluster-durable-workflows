@@ -1,8 +1,8 @@
-import Distributed
-import DistributedCluster
-import EventSourcing
-import Foundation
-import VirtualActors
+public import Distributed
+public import DistributedCluster
+public import EventSourcing
+public import Foundation
+public import VirtualActors
 
 public struct SchedulePersistenceID: Hashable, Codable, Sendable, CustomStringConvertible {
   public let rawValue: String

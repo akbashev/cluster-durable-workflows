@@ -1,10 +1,10 @@
-import Distributed
-import DistributedCluster
-import EventSourcing
-import Foundation
+public import Distributed
+public import DistributedCluster
+public import EventSourcing
+public import Foundation
 import ServiceLifecycle
 import Synchronization
-import VirtualActors
+public import VirtualActors
 
 public enum WorkflowRuntimeError: Error, Sendable, Equatable {
   case activityContainerNotRegistered(String)
@@ -529,7 +529,7 @@ where WorkflowType.Input == Input, WorkflowType.Output == Output {
   private let persistenceID: WorkflowPersistenceID
   private let workflowID: WorkflowID
   private let activityPool: WorkerPool<DurableActivityDispatchWorker<WorkflowType>>
-  private var currentExecutionTask: Task<WorkflowResult<WorkflowType.Output>, Error>?
+  private var currentExecutionTask: Task<WorkflowResult<WorkflowType.Output>, any Error>?
 
   /// Per-run operation cursor, reset at the start of every `_run`: each run —
   /// fresh or replayed — allocates 0, 1, 2… in call order across ALL journaled
@@ -860,7 +860,7 @@ where WorkflowType.Input == Input, WorkflowType.Output == Output {
   /// waits out only the remaining backoff — so a crash mid-backoff loses
   /// nothing.
   private func handleRunFailure(
-    _ error: Error,
+    _ error: any Error,
     input: WorkflowType.Input
   ) async throws -> WorkflowResult<WorkflowType.Output> {
     // A concurrent cancel/terminal transition wins over retrying or failing.
