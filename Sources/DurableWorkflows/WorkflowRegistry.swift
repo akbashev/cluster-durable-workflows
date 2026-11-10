@@ -1,6 +1,6 @@
-import Distributed
-import DistributedCluster
-import EventSourcing
+public import Distributed
+public import DistributedCluster
+public import EventSourcing
 
 /// A durable object that must be rediscovered after a process restart.
 public enum WorkflowRegistration: Codable, Sendable, Equatable {

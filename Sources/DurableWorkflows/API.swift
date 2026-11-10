@@ -1,7 +1,7 @@
 import Distributed
-import DistributedCluster
-import EventSourcing
-import Foundation
+public import DistributedCluster
+public import EventSourcing
+public import Foundation
 import VirtualActors
 
 @attached(extension, names: named(name), conformances: WorkflowProtocol)
@@ -157,7 +157,9 @@ public protocol ActivityReference {
 }
 
 public protocol ActivityContainerProtocol: Sendable {
-  func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data
+  /// Runs the activity `invocation` names. An activity is independent work that belongs to no
+  /// actor: it runs concurrently, never holding the worker that dispatched it.
+  @concurrent func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data
 }
 
 extension EventTag {

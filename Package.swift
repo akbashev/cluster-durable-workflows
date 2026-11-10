@@ -1,6 +1,16 @@
+// swift-tools-version: 6.4
 import CompilerPluginSupport
-// swift-tools-version: 6.2
 import PackageDescription
+
+/// The language as Swift 7 will have it, for every target.
+let swiftSettings: [SwiftSetting] = [
+  .enableUpcomingFeature("ExistentialAny"),
+  .enableUpcomingFeature("ImmutableWeakCaptures"),
+  .enableUpcomingFeature("InferIsolatedConformances"),
+  .enableUpcomingFeature("InternalImportsByDefault"),
+  .enableUpcomingFeature("MemberImportVisibility"),
+  .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+]
 
 let package = Package(
   name: "durable-workflows",
@@ -26,7 +36,8 @@ let package = Package(
         .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
         .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
         .product(name: "SwiftDiagnostics", package: "swift-syntax"),
-      ]
+      ],
+      swiftSettings: swiftSettings
     ),
     .target(
       name: "DurableWorkflows",
@@ -36,7 +47,8 @@ let package = Package(
         .product(name: "VirtualActors", package: "cluster-virtual-actors"),
         .product(name: "DistributedCluster", package: "swift-distributed-actors"),
         .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
-      ]
+      ],
+      swiftSettings: swiftSettings
     ),
     .testTarget(
       name: "DurableWorkflowsTests",
@@ -45,7 +57,8 @@ let package = Package(
         .product(name: "EventSourcing", package: "cluster-event-sourcing"),
         .product(name: "VirtualActors", package: "cluster-virtual-actors"),
         .product(name: "DistributedCluster", package: "swift-distributed-actors"),
-      ]
+      ],
+      swiftSettings: swiftSettings
     ),
   ]
 )

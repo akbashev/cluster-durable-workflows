@@ -1,8 +1,8 @@
 import Foundation
 import SwiftCompilerPlugin
-import SwiftSyntax
+public import SwiftSyntax
 import SwiftSyntaxBuilder
-import SwiftSyntaxMacros
+public import SwiftSyntaxMacros
 
 public struct WorkflowMacro: ExtensionMacro {
   public static func expansion(
@@ -148,7 +148,7 @@ public struct ActivityContainerMacro: MemberMacro, ExtensionMacro {
 
     let handleFunc: DeclSyntax =
       """
-      public func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data {
+      @concurrent public func handle(invocation: ActivityInvocation, on system: ClusterSystem) async throws -> Data {
           let decoder = JSONDecoder()
           decoder.userInfo[.actorSystemKey] = system
           let encoder = JSONEncoder()
@@ -181,7 +181,7 @@ public struct ActivityContainerMacro: MemberMacro, ExtensionMacro {
 
 @main
 struct DurableWorkflowsPlugin: CompilerPlugin {
-  let providingMacros: [Macro.Type] = [
+  let providingMacros: [any Macro.Type] = [
     WorkflowMacro.self,
     ActivityMacro.self,
     ActivityContainerMacro.self,
